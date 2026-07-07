@@ -1,0 +1,6 @@
+symbol = ["EURUSD", "GBPUSD"]
+timeframe = ["D1"]
+price_type = "BID"
+start = "2020-01-01"
+end = "2025-12-31"
+dir = "data"
