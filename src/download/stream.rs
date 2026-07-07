@@ -6,18 +6,26 @@ use tokio::io::AsyncWriteExt;
 use crate::DownloadTask;
 use crate::backoff::default_backoff;
 
+use chrono::Datelike;
+
+use crate::PeriodKind;
+
 const FEED_BASE: &str = "https://www.dukascopy.com/datafeed";
 
-fn map_timeframe(tf: &str) -> &'static str {
+pub fn map_timeframe(tf: &str) -> &'static str {
     match tf {
         "1m" | "M1" => "candles_min_1",
-        "5m" | "M5" => "candles_min_5",
-        "15m" | "M15" => "candles_min_15",
-        "30m" | "M30" => "candles_min_30",
         "1h" | "H1" => "candles_hour_1",
-        "4h" | "H4" => "candles_hour_4",
         "1d" | "D1" => "candles_day_1",
-        _ => "candices_day_1",
+        _ => "candles_day_1",
+    }
+}
+
+pub fn tf_period(tf: &str) -> PeriodKind {
+    match map_timeframe(tf) {
+        "candles_day_1" => PeriodKind::Year,
+        "candles_hour_1" => PeriodKind::Month,
+        _ => PeriodKind::Day,
     }
 }
 
@@ -25,14 +33,22 @@ pub fn build_url(
     symbol: &str,
     price_type: &str,
     tf: &str,
-    year: i32,
-    month: u32,
-    day: u32,
+    date: chrono::NaiveDate,
+    period: PeriodKind,
 ) -> String {
-    format!(
-        "{FEED_BASE}/{symbol}/{year:04}/{month:02}/{day:02}/{price_type}_{}.bi5",
-        map_timeframe(tf)
-    )
+    let (y, m, d) = (date.year(), date.month(), date.day());
+    let tfpart = map_timeframe(tf);
+    match period {
+        PeriodKind::Year => {
+            format!("{FEED_BASE}/{symbol}/{y:04}/{price_type}_{tfpart}.bi5")
+        }
+        PeriodKind::Month => {
+            format!("{FEED_BASE}/{symbol}/{y:04}/{m:02}/{price_type}_{tfpart}.bi5")
+        }
+        PeriodKind::Day => {
+            format!("{FEED_BASE}/{symbol}/{y:04}/{m:02}/{d:02}/{price_type}_{tfpart}.bi5")
+        }
+    }
 }
 
 pub async fn download_to_file(
@@ -130,17 +146,20 @@ mod tests {
         }
     }
 
-    fn make_task(server: &MockServer) -> DownloadTask {
-        let url = format!(
-            "{}/datafeed/EURUSD/2025/01/02/BID_candles_day_1.bi5",
-            server.uri()
-        );
+    fn make_task(server: &MockServer, period: PeriodKind) -> DownloadTask {
+        let path = match period {
+            PeriodKind::Year => "/datafeed/EURUSD/2025/BID_candles_day_1.bi5",
+            PeriodKind::Month => "/datafeed/EURUSD/2025/01/BID_candles_hour_1.bi5",
+            PeriodKind::Day => "/datafeed/EURUSD/2025/01/02/BID_candles_min_1.bi5",
+        };
+        let url = format!("{}{}", server.uri(), path);
         DownloadTask {
             url,
             dest: std::path::PathBuf::from("/tmp/test-download.bi5"),
             symbol: "EURUSD".into(),
             timeframe: "D1".into(),
             date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            period,
         }
     }
 
@@ -148,13 +167,13 @@ mod tests {
     async fn download_success() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/datafeed/EURUSD/2025/01/02/BID_candles_day_1.bi5"))
+            .and(path("/datafeed/EURUSD/2025/BID_candles_day_1.bi5"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"b5data"))
             .mount(&server)
             .await;
 
         let client = reqwest::Client::new();
-        let task = make_task(&server);
+        let task = make_task(&server, PeriodKind::Year);
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(result.is_ok());
     }
@@ -168,7 +187,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let task = make_task(&server);
+        let task = make_task(&server, PeriodKind::Year);
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::NotFound { .. })));
     }
@@ -182,7 +201,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let task = make_task(&server);
+        let task = make_task(&server, PeriodKind::Year);
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::DownloadFailed { .. })));
     }

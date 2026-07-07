@@ -7,4 +7,5 @@ pub mod download;
 pub mod error;
 
 pub use download::DownloadTask;
+pub use download::PeriodKind;
 pub use error::AppError;
