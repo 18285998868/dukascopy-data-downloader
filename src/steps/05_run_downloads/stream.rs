@@ -6,51 +6,6 @@ use tokio::io::AsyncWriteExt;
 use crate::DownloadTask;
 use crate::backoff::default_backoff;
 
-use chrono::Datelike;
-
-use crate::PeriodKind;
-
-const FEED_BASE: &str = "https://www.dukascopy.com/datafeed";
-
-pub fn map_timeframe(tf: &str) -> &'static str {
-    match tf {
-        "1m" | "M1" => "candles_min_1",
-        "1h" | "H1" => "candles_hour_1",
-        "1d" | "D1" => "candles_day_1",
-        _ => "candles_day_1",
-    }
-}
-
-pub fn tf_period(tf: &str) -> PeriodKind {
-    match map_timeframe(tf) {
-        "candles_day_1" => PeriodKind::Year,
-        "candles_hour_1" => PeriodKind::Month,
-        _ => PeriodKind::Day,
-    }
-}
-
-pub fn build_url(
-    symbol: &str,
-    price_type: &str,
-    tf: &str,
-    date: chrono::NaiveDate,
-    period: PeriodKind,
-) -> String {
-    let (y, m, d) = (date.year(), date.month(), date.day());
-    let tfpart = map_timeframe(tf);
-    match period {
-        PeriodKind::Year => {
-            format!("{FEED_BASE}/{symbol}/{y:04}/{price_type}_{tfpart}.bi5")
-        }
-        PeriodKind::Month => {
-            format!("{FEED_BASE}/{symbol}/{y:04}/{m:02}/{price_type}_{tfpart}.bi5")
-        }
-        PeriodKind::Day => {
-            format!("{FEED_BASE}/{symbol}/{y:04}/{m:02}/{d:02}/{price_type}_{tfpart}.bi5")
-        }
-    }
-}
-
 pub async fn download_to_file(
     client: &reqwest::Client,
     task: &DownloadTask,
@@ -134,6 +89,7 @@ async fn download_to_file_with_backoff(
 mod tests {
     use super::*;
     use crate::AppError;
+    use crate::PeriodKind;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -146,7 +102,11 @@ mod tests {
         }
     }
 
-    fn make_task(server: &MockServer, period: PeriodKind) -> DownloadTask {
+    fn make_task(
+        server: &MockServer,
+        period: PeriodKind,
+        dest: std::path::PathBuf,
+    ) -> DownloadTask {
         let path = match period {
             PeriodKind::Year => "/datafeed/EURUSD/2025/BID_candles_day_1.bi5",
             PeriodKind::Month => "/datafeed/EURUSD/2025/01/BID_candles_hour_1.bi5",
@@ -155,7 +115,7 @@ mod tests {
         let url = format!("{}{}", server.uri(), path);
         DownloadTask {
             url,
-            dest: std::path::PathBuf::from("/tmp/test-download.bi5"),
+            dest,
             symbol: "EURUSD".into(),
             timeframe: "D1".into(),
             date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
@@ -173,7 +133,12 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let task = make_task(&server, PeriodKind::Year);
+        let dir = tempfile::tempdir().unwrap();
+        let task = make_task(
+            &server,
+            PeriodKind::Year,
+            dir.path().join("test-download.bi5"),
+        );
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(result.is_ok());
     }
@@ -187,7 +152,12 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let task = make_task(&server, PeriodKind::Year);
+        let dir = tempfile::tempdir().unwrap();
+        let task = make_task(
+            &server,
+            PeriodKind::Year,
+            dir.path().join("test-download.bi5"),
+        );
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::NotFound { .. })));
     }
@@ -201,7 +171,12 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let task = make_task(&server, PeriodKind::Year);
+        let dir = tempfile::tempdir().unwrap();
+        let task = make_task(
+            &server,
+            PeriodKind::Year,
+            dir.path().join("test-download.bi5"),
+        );
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::DownloadFailed { .. })));
     }

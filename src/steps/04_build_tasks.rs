@@ -1,36 +1,53 @@
-pub mod stream;
-
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 use chrono::Datelike;
 use chrono::NaiveDate;
-use futures::future::join_all;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 
-use crate::cache;
-use crate::error::AppError;
+use crate::DownloadTask;
+use crate::PeriodKind;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PeriodKind {
-    Year,
-    Month,
-    Day,
+const FEED_BASE: &str = "https://www.dukascopy.com/datafeed";
+
+pub fn map_timeframe(tf: &str) -> &'static str {
+    match tf {
+        "1m" | "M1" => "candles_min_1",
+        "1h" | "H1" => "candles_hour_1",
+        "1d" | "D1" => "candles_day_1",
+        _ => "candles_day_1",
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct DownloadTask {
-    pub url: String,
-    pub dest: PathBuf,
-    pub symbol: String,
-    pub timeframe: String,
-    pub date: NaiveDate,
-    pub period: PeriodKind,
+pub fn tf_period(tf: &str) -> PeriodKind {
+    match map_timeframe(tf) {
+        "candles_day_1" => PeriodKind::Year,
+        "candles_hour_1" => PeriodKind::Month,
+        _ => PeriodKind::Day,
+    }
 }
 
-fn period_label(date: NaiveDate, period: PeriodKind) -> String {
+pub fn build_url(
+    symbol: &str,
+    price_type: &str,
+    tf: &str,
+    date: NaiveDate,
+    period: PeriodKind,
+) -> String {
+    let (y, m, d) = (date.year(), date.month(), date.day());
+    let tfpart = map_timeframe(tf);
+    match period {
+        PeriodKind::Year => {
+            format!("{FEED_BASE}/{symbol}/{y:04}/{price_type}_{tfpart}.bi5")
+        }
+        PeriodKind::Month => {
+            format!("{FEED_BASE}/{symbol}/{y:04}/{m:02}/{price_type}_{tfpart}.bi5")
+        }
+        PeriodKind::Day => {
+            format!("{FEED_BASE}/{symbol}/{y:04}/{m:02}/{d:02}/{price_type}_{tfpart}.bi5")
+        }
+    }
+}
+
+pub fn period_label(date: NaiveDate, period: PeriodKind) -> String {
     match period {
         PeriodKind::Year => format!("{}", date.year()),
         PeriodKind::Month => format!("{}-{:02}", date.year(), date.month()),
@@ -98,9 +115,9 @@ pub fn build_tasks(
 
     for symbol in symbols {
         for tf in timeframes {
-            let period = stream::tf_period(tf);
+            let period = tf_period(tf);
             for date in build_date_range(start, end, period) {
-                let url = stream::build_url(symbol, price_type, tf, date, period);
+                let url = build_url(symbol, price_type, tf, date, period);
                 let dest = base
                     .join(symbol)
                     .join(tf)
@@ -118,137 +135,6 @@ pub fn build_tasks(
     }
 
     tasks
-}
-
-fn check_cached(task: &DownloadTask, ttl_secs: Option<u64>) -> bool {
-    let key = format!(
-        "{}/{}/{}",
-        task.symbol,
-        task.timeframe,
-        period_label(task.date, task.period)
-    );
-    cache::read("downloaded", &key, ttl_secs).is_some()
-}
-
-fn mark_cached(task: &DownloadTask) {
-    let key = format!(
-        "{}/{}/{}",
-        task.symbol,
-        task.timeframe,
-        period_label(task.date, task.period)
-    );
-    cache::write("downloaded", &key, b"1");
-}
-
-pub async fn run_downloads(
-    client: &reqwest::Client,
-    tasks: Vec<DownloadTask>,
-    force: bool,
-) -> Result<(), AppError> {
-    let (to_download, skipped) = if force {
-        (tasks, 0usize)
-    } else {
-        let mut dl = Vec::new();
-        let mut sk = 0usize;
-        for t in tasks {
-            if t.dest.exists() || check_cached(&t, None) {
-                sk += 1;
-            } else {
-                dl.push(t);
-            }
-        }
-        (dl, sk)
-    };
-
-    let total = to_download.len() + skipped;
-    if to_download.is_empty() {
-        tracing::debug!("nothing to download (skipped {skipped})");
-        return Ok(());
-    }
-
-    tracing::debug!(total = to_download.len(), skipped, "downloading files");
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let total_new = to_download.len();
-    let semaphore = Arc::new(Semaphore::new(30));
-
-    let handles = to_download.into_iter().map(|task| {
-        let c = client.clone();
-        let sem = Arc::clone(&semaphore);
-        let cnt = Arc::clone(&counter);
-        async move {
-            let _permit = sem.acquire().await.unwrap();
-            let idx = cnt.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::debug!(
-                pair = %task.symbol,
-                tf = %task.timeframe,
-                date = %task.date,
-                "[{idx}/{total_new}] downloading"
-            );
-            let result = stream::download_to_file(&c, &task).await;
-            match &result {
-                Ok(()) => {
-                    mark_cached(&task);
-                    tracing::debug!(
-                        pair = %task.symbol,
-                        tf = %task.timeframe,
-                        date = %task.date,
-                        "[{idx}/{total_new}] done"
-                    );
-                }
-                Err(AppError::NotFound { .. }) => {
-                    mark_cached(&task);
-                    tracing::debug!(
-                        pair = %task.symbol,
-                        tf = %task.timeframe,
-                        date = %task.date,
-                        "[{idx}/{total_new}] 404 (no data)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        pair = %task.symbol,
-                        tf = %task.timeframe,
-                        date = %task.date,
-                        "[{idx}/{total_new}] failed: {e}"
-                    );
-                }
-            }
-            result
-        }
-    });
-
-    let results = join_all(handles).await;
-    aggregate_results(results, total)
-}
-
-fn aggregate_results(results: Vec<Result<(), AppError>>, total: usize) -> Result<(), AppError> {
-    let (_ok, nf, fail) = results.iter().fold((0, 0, 0), |(ok, nf, fail), r| match r {
-        Ok(_) => (ok + 1, nf, fail),
-        Err(AppError::NotFound { .. }) => (ok, nf + 1, fail),
-        _ => (ok, nf, fail + 1),
-    });
-
-    if nf > 0 {
-        tracing::debug!(
-            not_found = nf,
-            total,
-            "files not found (expected for edge dates)"
-        );
-    }
-    if fail > 0 {
-        tracing::error!(
-            failed = fail,
-            not_found = nf,
-            total,
-            "some downloads failed"
-        );
-        return Err(AppError::Data(format!(
-            "{fail} download(s) failed ({nf} not found)"
-        )));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -385,40 +271,8 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_all_ok() {
-        let results = vec![Ok(()), Ok(()), Ok(())];
-        assert!(aggregate_results(results, 3).is_ok());
-    }
-
-    #[test]
-    fn aggregate_not_found_only_is_ok() {
-        let results = vec![
-            Err(AppError::NotFound { url: "a".into() }),
-            Err(AppError::NotFound { url: "b".into() }),
-        ];
-        assert!(aggregate_results(results, 2).is_ok());
-    }
-
-    #[test]
-    fn aggregate_one_fail_returns_err() {
-        let results = vec![
-            Ok(()),
-            Err(AppError::DownloadFailed {
-                url: "a".into(),
-                reason: "timeout".into(),
-            }),
-        ];
-        assert!(aggregate_results(results, 2).is_err());
-    }
-
-    #[test]
-    fn aggregate_empty_vec_ok() {
-        assert!(aggregate_results(vec![], 0).is_ok());
-    }
-
-    #[test]
     fn build_url_year() {
-        let url = stream::build_url(
+        let url = build_url(
             "BTCUSD",
             "ASK",
             "D1",
@@ -430,7 +284,7 @@ mod tests {
 
     #[test]
     fn build_url_month() {
-        let url = stream::build_url(
+        let url = build_url(
             "BTCUSD",
             "ASK",
             "H1",
@@ -442,7 +296,7 @@ mod tests {
 
     #[test]
     fn build_url_day() {
-        let url = stream::build_url(
+        let url = build_url(
             "BTCUSD",
             "BID",
             "M1",
