@@ -14,35 +14,21 @@
 
 ## 架构设计
 
-| 文件架构(保持顺序)              | 功能简介       | 库依赖                               |
-| ------------------------------- | -------------- | ------------------------------------ |
-| `main.rs`                       | 只做入口调用   | tokio、tracing-subscriber、anyhow    |
-| `lib.rs`                        | 只做模块导入导出 | std(PathBuf)、chrono(NaiveDate)   |
-| `error.rs`                      | 错误处理       | thiserror 2                          |
-| `cache.rs`                      | 缓存(redb)     | redb 4                               |
-| `backoff.rs`                    | 退避策略       | backoff 0.4(tokio)                   |
-| `app/`                          | 步骤目录       | —                                    |
-| `app/mod.rs`                    | 整体流程编配   | chrono、anyhow、reqwest              |
-| `app/01_cli.rs`                 | 命令行解析     | clap 4(derive)                       |
-| `app/02_config.rs`              | 配置解析       | config 0.15(config-rs, toml)+ serde  |
-| `app/03_build_client.rs`        | 构建网络客户端 | reqwest、tokio                       |
-| `app/04_build_tasks.rs`         | 构建下载任务   | chrono                               |
-| `app/05_run_downloads/mod.rs`   | 运行下载任务   | tokio(Semaphore)、futures(join_all)、redb |
-| `app/05_run_downloads/stream.rs`| 下载任务流     | reqwest、tokio、backoff              |
-
-## 具体逻辑
-
-```text
-入口 -> main.rs -> 调用 lib 导出的 app::run
-
-流程编排 -> app/mod.rs -> 加载配置 → 日期校验 → 构建 client → 生成任务 → 并发下载
-              -> app/01_cli.rs           -> 解析 --config/-c(可选),缺省 crate 内 config/config.toml
-              -> app/02_config.rs        -> 读 TOML,全字段默认值兜底
-              -> app/03_build_client.rs  -> TCP 探测直连 → SOCKS5 回退
-              -> app/04_build_tasks.rs   -> tf→周期映射,枚举日期,拼 URL/路径 → DownloadTask
-              -> app/05_run_downloads/mod.rs   -> 已存在/缓存过滤 → Semaphore(30) 并发 → 404 标记 → 聚合
-              -> app/05_run_downloads/stream.rs -> GET 流式写 .bi5.tmp → flush → rename;404 永久/5xx 重试
-```
+| 文件架构(保持顺序)              | 功能简介       | 库依赖                               | 具体逻辑                                                                                                          |
+| ------------------------------- | -------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `main.rs`                       | 只做入口调用   | tokio、tracing-subscriber、anyhow    | 初始化 tracing(fmt + env-filter)→ `dukascopy_data_downloader::cli::parse()` → `app::run(config)`                  |
+| `lib.rs`                        | 只做模块导入导出 | std(PathBuf)、chrono(NaiveDate)   | `#[path]` 挂载 `app/` 各步骤 + 支撑模块;定义 `DownloadTask`/`PeriodKind`;`pub use error::AppError`              |
+| `error.rs`                      | 错误处理       | thiserror 2                          | `AppError` 枚举(Config/Http/Io/NotFound/DownloadFailed/Data),`#[from]` 实现 `?` 自动转换                         |
+| `cache.rs`                      | 缓存(redb)     | redb 4                               | `read/write(domain,key,ttl)` 通用 KV 缓存,值带 8 字节时间戳前缀实现 TTL;静态进程级 DB 池                          |
+| `backoff.rs`                    | 退避策略       | backoff 0.4(tokio)                   | `default_backoff()`:指数退避,`max_elapsed_time = 30s`                                                             |
+| `app/`                          | 步骤目录       | —                                    | 流水线按 `NN_` 编号归档;磁盘名带数字前缀,模块名经 `#[path]` 取可读步骤名                                          |
+| `app/mod.rs`                    | 整体流程编配   | chrono、anyhow、reqwest              | load 配置 → `parse_date` + `start>end` 校验 → `build_tasks` → `build_client` → `run_downloads(force=false)`        |
+| `app/01_cli.rs`                 | 命令行解析     | clap 4(derive)                       | 解析 `--config/-c`(可选),为 `None` 时回退 crate 内 `config/config.toml`                                           |
+| `app/02_config.rs`              | 配置解析       | config 0.15(config-rs, toml)+ serde  | `Config::load` 读 TOML(`#[serde(default)]` 全字段默认值);空 `symbol`/`timeframe` 回落默认                          |
+| `app/03_build_client.rs`        | 构建网络客户端 | reqwest、tokio                       | 5s TCP 探测直连 `www.dukascopy.com:443` → 失败再探 SOCKS5 `127.0.0.1:7890`;直连 30s/代理 60s;全挂 bail 无网络      |
+| `app/04_build_tasks.rs`         | 构建下载任务   | chrono                               | `map_timeframe`/`tf_period` 映射周期;枚举代表日期;`build_url` + `dest_filename`;三层循环 → `Vec<DownloadTask>`    |
+| `app/05_run_downloads/mod.rs`   | 运行下载任务   | tokio(Semaphore)、futures(join_all)、redb | 已存在/缓存过滤 → `Semaphore(30)` + `join_all` 并发 → 成功/404 写缓存 → `aggregate_results`(`failed>0` 才报错) |
+| `app/05_run_downloads/stream.rs`| 下载任务流     | reqwest、tokio、backoff              | 单文件 GET → 非 2xx:404 `Permanent(NotFound)`、其余 `Transient`;写 `.bi5.tmp` → flush → rename 原子落盘;重试 ≤30s |
 
 ## 参考资料
 
