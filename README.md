@@ -13,12 +13,13 @@ data/                      # 下载产物: {dir}/dukascopy/{symbol}/{tf}/{symbol
 CHANGELOG.md               # 变更记录
 docs/dev.md                # 开发笔记
 src/
-  main.rs                  # 入口: tracing → dkdd::cli::parse → dkdd::app::run
-  lib.rs                   # #[path] 模块声明 + DownloadTask/PeriodKind 定义
+  main.rs                  # 入口: tracing → dukascopy_data_downloader::cli::parse → app::run
+  lib.rs                   # 模块声明 (#[path]) + DownloadTask/PeriodKind 定义
   error.rs                 # 支撑: AppError (thiserror)
   cache.rs                 # 支撑: redb 缓存 (read/write/TTL)
   backoff.rs               # 支撑: 默认指数退避 (max 30s)
-  steps/                   # 按流水线步骤归档 (磁盘文件名带数字前缀, 模块名 = 可读步骤名)
+  app/                     # 按流水线步骤归档 (磁盘文件名带数字前缀, 模块名 = 可读步骤名)
+    mod.rs                     app: 编排 (config → 日期校验 → client → tasks → run_downloads)
     01_cli.rs                  cli:  解析 --config/-c (可选, 缺省 crate 内 config/config.toml)
     02_config.rs               config: Config::load + 空 symbol/timeframe 默认值兜底
     03_build_client.rs         build_client: TCP 探测直连 → SOCKS5(127.0.0.1:7890) 回退
@@ -26,7 +27,6 @@ src/
     05_run_downloads/
       mod.rs                   run_downloads: Semaphore(30) 并发 + 已存在/缓存过滤 + 404 标记 + 聚合
       stream.rs                stream: GET → .bi5.tmp 原子写 → rename, backoff 重试
-    06_app.rs                  app: 编排 (config → 日期校验 → client → tasks → run_downloads)
 ```
 
 ## 配置

@@ -1,61 +1,52 @@
-# 开发笔记:每个步骤做了什么
+# dukascopy-data-downloader 项目开发
 
-源码按流水线步骤归档于 `src/steps/NN_*.rs`,模块名经 `lib.rs` 的 `#[path]` 映射为可读步骤名
-(`cli`/`config`/`build_client`/`build_tasks`/`run_downloads`/`app`)。`01_cli`/`02_config`/`06_app`
-保留原名,其余模块名 = 磁盘名去掉数字前缀。步骤间通过函数调用串联,`06_app.rs` 是顶层编排。
+## 需求分析
+
+- 项目目标: 从 [Dukascopy Datafeed](https://www.dukascopy.com/datafeed) 下载历史 K 线原始 `.bi5` 文件(LZMA 压缩,不做解码),按 `symbol × timeframe × 周期` 一文件一个 `.bi5` 落到本地。
+- 周期随 timeframe 而定:`D1/1d`=年文件、`H1/1h`=月文件、`M1/1m`=日文件。
+
+## 技术选型
+
+- 语言: rust
+- edition = "2024"
+- 网络: reqwest 0.13(`rustls` + `socks`,直连与 SOCKS5 代理)
+- 并发: tokio + futures `join_all` + `Semaphore(30)` 有界并发
+
+## 架构设计
+
+| 文件架构(保持顺序)              | 功能简介       | 库依赖                               |
+| ------------------------------- | -------------- | ------------------------------------ |
+| `main.rs`                       | 只做入口调用   | tokio、tracing-subscriber、anyhow    |
+| `lib.rs`                        | 只做模块导入导出 | std(PathBuf)、chrono(NaiveDate)   |
+| `error.rs`                      | 错误处理       | thiserror 2                          |
+| `cache.rs`                      | 缓存(redb)     | redb 4                               |
+| `backoff.rs`                    | 退避策略       | backoff 0.4(tokio)                   |
+| `app/`                          | 步骤目录       | —                                    |
+| `app/mod.rs`                    | 整体流程编配   | chrono、anyhow、reqwest              |
+| `app/01_cli.rs`                 | 命令行解析     | clap 4(derive)                       |
+| `app/02_config.rs`              | 配置解析       | config 0.15(config-rs, toml)+ serde  |
+| `app/03_build_client.rs`        | 构建网络客户端 | reqwest、tokio                       |
+| `app/04_build_tasks.rs`         | 构建下载任务   | chrono                               |
+| `app/05_run_downloads/mod.rs`   | 运行下载任务   | tokio(Semaphore)、futures(join_all)、redb |
+| `app/05_run_downloads/stream.rs`| 下载任务流     | reqwest、tokio、backoff              |
+
+## 具体逻辑
 
 ```text
-src/main.rs                     入口, anyhow context
-src/lib.rs                      #[path] 模块声明 + DownloadTask/PeriodKind 定义 + re-export
-src/error.rs                    支撑: AppError(thiserror)
-src/cache.rs                    支撑: redb 通用缓存(read/write/TTL)
-src/backoff.rs                  支撑: 默认指数退避(max 30s)
+入口 -> main.rs -> 调用 lib 导出的 app::run
 
-steps/01_cli.rs                 cli:  clap: --config/-c (可选, 缺省 crate 内 config/config.toml)
-steps/02_config.rs              config: Config::load + #[serde(default)] 全字段默认值
-steps/03_build_client.rs        build_client: TCP 探测直连 443 → SOCKS5 127.0.0.1:7890 回退
-steps/04_build_tasks.rs         build_tasks: tf→周期(D1-年/H1-月/M1-日) + URL/路径构建
-steps/05_run_downloads/mod.rs   run_downloads: 已存在/缓存过滤 → Semaphore(30) 并发 → 404 标记 → 聚合
-steps/05_run_downloads/stream.rs stream: GET → .bi5.tmp 原子写 → rename; 网络/5xx 重试, 404 永久
-steps/06_app.rs                 app: 编排(config → 日期解析校验 → client → build_tasks → run_downloads)
+流程编排 -> app/mod.rs -> 加载配置 → 日期校验 → 构建 client → 生成任务 → 并发下载
+              -> app/01_cli.rs           -> 解析 --config/-c(可选),缺省 crate 内 config/config.toml
+              -> app/02_config.rs        -> 读 TOML,全字段默认值兜底
+              -> app/03_build_client.rs  -> TCP 探测直连 → SOCKS5 回退
+              -> app/04_build_tasks.rs   -> tf→周期映射,枚举日期,拼 URL/路径 → DownloadTask
+              -> app/05_run_downloads/mod.rs   -> 已存在/缓存过滤 → Semaphore(30) 并发 → 404 标记 → 聚合
+              -> app/05_run_downloads/stream.rs -> GET 流式写 .bi5.tmp → flush → rename;404 永久/5xx 重试
 ```
 
-## 01_cli.rs (`cli`)
+## 参考资料
 
-clap 解析命令行,`--config/-c` 可选;为 `None` 时由 `config::load` 回退到 crate 内默认路径。
-
-## 02_config.rs (`config`)
-
-`Config::load`:`#[serde(default)]` + `Default` 全字段兜底,读 TOML;空 `symbol`/`timeframe` 回落默认值。
-日期字符串合法性不在配置层校验,由 `app` 解析。
-
-## 03_build_client.rs (`build_client`)
-
-`build_client`:5s 内先 TCP 探测 `www.dukascopy.com:443`(直连),失败再探测 SOCKS5
-`127.0.0.1:7890`;直连超时 30s,代理超时 60s;都失败则 `anyhow::bail!("no network")`。
-
-## 04_build_tasks.rs (`build_tasks`)
-
-`map_timeframe`/`tf_period`:tf 别名 → 数据后缀 + 周期(年/月/日)。`build_date_range` 按周期枚举
-日期代表点;`build_url` 拼 Datafeed URL(`/datafeed/{symbol}/{y}/{m}/{d}/{price}_{suffix}.bi5`);
-`dest_filename` 生成 `{symbol}-{tf}-{period}.bi5`。`build_tasks` 三层循环 `symbol × tf × date`
-产出全部 `DownloadTask`(O(日数) 内存)。
-
-## 05_run_downloads/ (`run_downloads`)
-
-- `mod.rs`:`run_downloads` 先过滤(`dest.exists()` 或 redb 缓存命中 → skip);并发用
-  `Semaphore(30)` + `join_all`,`force=true` 可跳过过滤。`aggregate_results`:404 计 `not_found`
-  (预期),`failed > 0` 才返回 `AppError::Data`;成功与 404 都 `mark_cached` 写缓存,
-  保证幂等、404 不重复请求。
-- `stream.rs`:`download_to_file` → GET → 非 2xx:404 `Permanent(NotFound)`、其余 `Transient`;
-  网络错误/读流 `Transient`;写 `.bi5.tmp` → flush → rename 原子落盘。`backoff` 上限 30s。
-
-## 06_app.rs (`app`)
-
-顶层编排:load 配置 → `parse_date`(YYYY-MM-DD)+ `start > end` 校验 → `build_tasks` →
-`build_client` → `run_downloads(client, tasks, force=false)`。
-
-## 时间粒度与 URL 模式
+### 时间粒度与 URL 模式
 
 | 别名 | 后缀 | 周期 | URL 模式 |
 |------|------|------|----------|
@@ -65,15 +56,13 @@ clap 解析命令行,`--config/-c` 可选;为 `None` 时由 `config::load` 回�
 
 Base URL: `https://www.dukascopy.com/datafeed`
 
-## 支持品种
+### 输出格式
 
-- 外汇: 标准对 (EURUSD, GBPJPY, AUDNZD 等)
-- 金属: XAUUSD, XAGUSD
-- 加密货币: BTCUSD, ETHUSD, XRPUSD
-- 指数: USA30IDXUSD, USA500IDXUSD, GBRIDXGBP 等
-- **不包含**: 个股、铂金(XPTUSD)
-
-## 输出格式
-
-原始 `.bi5` 文件 (LZMA 压缩), 不做解码。文件名:
+原始 `.bi5`(LZMA 压缩),文件名按周期:
 `{symbol}-D1-{year}.bi5` / `{symbol}-H1-{year}-{month}.bi5` / `{symbol}-M1-{year}-{month}-{day}.bi5`。
+
+### 并发与幂等
+
+- 并发固定 `Semaphore(30)`;配对全量并行,文件级失败不中断同批。
+- 成功与 404 都写入 redb 缓存(`domain=downloaded`),重跑自动跳过已下载/已确认无数据的文件。
+- 网络错误、HTTP 5xx 为 `Transient` 走 backoff 重试(30s 封顶);404 标记后不再请求。
