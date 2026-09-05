@@ -3,8 +3,8 @@ use backoff::backoff::Backoff;
 use backoff::future::retry;
 use tokio::io::AsyncWriteExt;
 
-use crate::DownloadTask;
 use crate::backoff::default_backoff;
+use crate::config::DownloadTask;
 
 pub async fn download_to_file(
     client: &reqwest::Client,
@@ -23,7 +23,7 @@ async fn download_to_file_with_backoff(
         let u = task.url.clone();
         let dest = task.dest.clone();
         async move {
-            let resp = match c.get(&u).send().await {
+            let mut resp = match c.get(&u).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     return Err(BackoffError::Transient {
@@ -38,7 +38,9 @@ async fn download_to_file_with_backoff(
                     Err(BackoffError::Permanent(crate::AppError::NotFound {
                         url: u,
                     }))
-                } else {
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+                {
                     Err(BackoffError::Transient {
                         err: crate::AppError::DownloadFailed {
                             url: u,
@@ -46,6 +48,11 @@ async fn download_to_file_with_backoff(
                         },
                         retry_after: None,
                     })
+                } else {
+                    Err(BackoffError::Permanent(crate::AppError::DownloadFailed {
+                        url: u,
+                        reason: format!("HTTP {status}"),
+                    }))
                 };
             }
 
@@ -60,14 +67,14 @@ async fn download_to_file_with_backoff(
                 .await
                 .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
 
-            let bytes = resp.bytes().await.map_err(|e| BackoffError::Transient {
+            while let Some(chunk) = resp.chunk().await.map_err(|e| BackoffError::Transient {
                 err: crate::AppError::from(e),
                 retry_after: None,
-            })?;
-
-            tokio::io::AsyncWriteExt::write_all(&mut file, &bytes)
-                .await
-                .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+            })? {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+            }
 
             file.flush()
                 .await
@@ -89,7 +96,7 @@ async fn download_to_file_with_backoff(
 mod tests {
     use super::*;
     use crate::AppError;
-    use crate::PeriodKind;
+    use crate::config::PeriodKind;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -98,6 +105,15 @@ mod tests {
             current_interval: std::time::Duration::ZERO,
             initial_interval: std::time::Duration::ZERO,
             max_elapsed_time: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        }
+    }
+
+    fn retry_until_success() -> backoff::ExponentialBackoff {
+        backoff::ExponentialBackoff {
+            current_interval: std::time::Duration::ZERO,
+            initial_interval: std::time::Duration::ZERO,
+            max_elapsed_time: Some(std::time::Duration::from_secs(10)),
             ..Default::default()
         }
     }
@@ -179,5 +195,46 @@ mod tests {
         );
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::DownloadFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn download_200_chunks_streamed_to_dest() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/datafeed/EURUSD/2025/BID_candles_day_1.bi5"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"b5data-chunked"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("test-stream.bi5");
+        let task = make_task(&server, PeriodKind::Year, dest.clone());
+        let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"b5data-chunked");
+    }
+
+    #[tokio::test]
+    async fn download_400_is_permanent_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/datafeed/EURUSD/2025/BID_candles_day_1.bi5"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let task = make_task(
+            &server,
+            PeriodKind::Year,
+            dir.path().join("test-download.bi5"),
+        );
+        // Even with a generous backoff window, a 400 must not be retried.
+        let result = download_to_file_with_backoff(&client, &task, retry_until_success()).await;
+        assert!(matches!(result, Err(AppError::DownloadFailed { .. })));
+        server.verify().await;
     }
 }

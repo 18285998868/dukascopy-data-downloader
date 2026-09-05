@@ -1,28 +1,23 @@
 use std::path::Path;
+use std::time::Duration;
 
-use chrono::NaiveDate;
-
-use crate::build_client::build_client;
-use crate::build_tasks::build_tasks;
 use crate::config::Config;
-use crate::run_downloads::run_downloads;
 
-pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
+/// Run the full batch download pipeline.
+///
+/// 1. Load config (validated: symbols, timeframes, price types, date order)
+/// 2. Build every download task (symbol × timeframe × period)
+/// 3. Probe network (direct → SOCKS5 proxy fallback)
+/// 4. Download all tasks with bounded concurrency
+pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
 
-    let start = parse_date(&cfg.start, "start")?;
-    let end = parse_date(&cfg.end, "end")?;
-
-    if start > end {
-        anyhow::bail!("start date {start} is after end date {end}");
-    }
-
-    let tasks = build_tasks(
+    let tasks = crate::build_tasks::build_tasks(
         &cfg.symbol,
         &cfg.timeframe,
         &cfg.price_type,
-        start,
-        end,
+        cfg.start,
+        cfg.end,
         &cfg.dir,
     );
 
@@ -31,35 +26,47 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         symbols = cfg.symbol.len(),
         timeframes = cfg.timeframe.len(),
         total,
-        "starting dukascopy batch download"
+        "starting dukascopy batch download",
     );
 
     let client = build_client().await?;
 
-    run_downloads(&client, tasks, false).await?;
+    crate::run_downloads::run_downloads(&client, tasks, false).await?;
 
     tracing::info!("batch download complete");
     Ok(())
 }
 
-fn parse_date(s: &str, label: &str) -> Result<NaiveDate, anyhow::Error> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|e| anyhow::anyhow!("invalid {label} date '{s}': {e}"))
-}
+/// Build a client that tries direct first, then falls back to SOCKS5 proxy.
+async fn build_client() -> anyhow::Result<reqwest::Client> {
+    let base_builder = || reqwest::Client::builder().user_agent("dukascopy-data-downloader/0.1");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let direct = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect("www.dukascopy.com:443"),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
 
-    #[test]
-    fn parse_date_valid() {
-        let d = parse_date("2025-01-01", "start").unwrap();
-        assert_eq!(d, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+    if direct.is_some() {
+        return Ok(base_builder().timeout(Duration::from_secs(30)).build()?);
     }
 
-    #[test]
-    fn parse_date_invalid() {
-        assert!(parse_date("2025-13-01", "start").is_err());
-        assert!(parse_date("abc", "start").is_err());
+    let proxy = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect("127.0.0.1:7890"),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
+
+    if proxy.is_some() {
+        return Ok(base_builder()
+            .timeout(Duration::from_secs(60))
+            .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:7890")?)
+            .build()?);
     }
+
+    anyhow::bail!("no network (tried direct and SOCKS5 proxy at 127.0.0.1:7890)")
 }

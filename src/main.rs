@@ -1,13 +1,26 @@
+//! Binary entry point for `dukascopy-data-downloader`.
+//!
+//! Initializes tracing, parses command-line arguments, then runs the
+//! full download pipeline with the provided TOML configuration.
+
+use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize tracing with `RUST_LOG` (falls back to `info`).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let cli = dukascopy_data_downloader::cli::parse();
-    dukascopy_data_downloader::app::run(cli.config.as_deref()).await
+    // Parse command-line arguments (`--config`/`-c` is required).
+    let cli = ddd::cli::parse();
+
+    // Run the download pipeline, annotating any error with pipeline context.
+    ddd::app::run(&cli.config)
+        .await
+        .context("dukascopy-data-downloader run failed")?;
+    Ok(())
 }

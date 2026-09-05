@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use chrono::Datelike;
 use chrono::NaiveDate;
 
-use crate::DownloadTask;
-use crate::PeriodKind;
+use crate::config::DownloadTask;
+use crate::config::PeriodKind;
 
 const FEED_BASE: &str = "https://www.dukascopy.com/datafeed";
 

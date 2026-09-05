@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::AppError;
-use crate::DownloadTask;
 use crate::build_tasks::period_label;
 use crate::cache;
+use crate::config::DownloadTask;
 
 fn check_cached(task: &DownloadTask, ttl_secs: Option<u64>) -> bool {
     let key = format!(
