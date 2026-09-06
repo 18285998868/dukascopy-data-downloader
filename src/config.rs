@@ -22,8 +22,8 @@ fn default_end() -> NaiveDate {
     chrono::Local::now().date_naive() - chrono::Duration::days(1)
 }
 
-fn default_dir() -> String {
-    "data".into()
+fn default_dir() -> PathBuf {
+    PathBuf::from("data")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,7 +38,7 @@ pub struct Config {
     #[serde(default = "default_end")]
     pub end: NaiveDate,
     #[serde(default = "default_dir")]
-    pub dir: String,
+    pub dir: PathBuf,
 }
 
 impl Config {
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(cfg.price_type, "ASK");
         assert_eq!(cfg.start, NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
         assert_eq!(cfg.end, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
-        assert_eq!(cfg.dir, "/tmp/data");
+        assert_eq!(cfg.dir, PathBuf::from("/tmp/data"));
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(cfg.price_type, "BID");
         assert_eq!(cfg.start, default_start());
         assert_eq!(cfg.end, default_end());
-        assert_eq!(cfg.dir, "data");
+        assert_eq!(cfg.dir, PathBuf::from("data"));
     }
 
     #[test]

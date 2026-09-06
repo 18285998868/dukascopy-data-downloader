@@ -3,33 +3,48 @@ pub mod stream;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use futures::future::join_all;
+use futures::stream::{self as fstream, StreamExt};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 use crate::AppError;
 use crate::build_tasks::period_label;
 use crate::cache;
 use crate::config::DownloadTask;
 
-fn check_cached(task: &DownloadTask, ttl_secs: Option<u64>) -> bool {
-    let key = format!(
+/// Successful downloads are cached permanently; 404s live in their own
+/// domain with a short TTL so edge dates published late are retried
+/// instead of being skipped forever.
+const NOT_FOUND_DOMAIN: &str = "downloaded-notfound";
+const NOT_FOUND_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn cache_key(task: &DownloadTask) -> String {
+    format!(
         "{}/{}/{}",
         task.symbol,
         task.timeframe,
         period_label(task.date, task.period)
-    );
-    cache::read("downloaded", &key, ttl_secs).is_some()
+    )
+}
+
+fn check_cached(task: &DownloadTask, ttl_secs: Option<u64>) -> bool {
+    cache::read("downloaded", &cache_key(task), ttl_secs).is_some()
 }
 
 fn mark_cached(task: &DownloadTask) {
-    let key = format!(
-        "{}/{}/{}",
-        task.symbol,
-        task.timeframe,
-        period_label(task.date, task.period)
-    );
-    cache::write("downloaded", &key, b"1");
+    cache::write("downloaded", &cache_key(task), b"1");
+}
+
+fn check_not_found(task: &DownloadTask) -> bool {
+    cache::read(
+        NOT_FOUND_DOMAIN,
+        &cache_key(task),
+        Some(NOT_FOUND_CACHE_TTL_SECS),
+    )
+    .is_some()
+}
+
+fn mark_not_found(task: &DownloadTask) {
+    cache::write(NOT_FOUND_DOMAIN, &cache_key(task), b"1");
 }
 
 pub async fn run_downloads(
@@ -43,7 +58,7 @@ pub async fn run_downloads(
         let mut dl = Vec::new();
         let mut sk = 0usize;
         for t in tasks {
-            if t.dest.exists() || check_cached(&t, None) {
+            if t.dest.exists() || check_cached(&t, None) || check_not_found(&t) {
                 sk += 1;
             } else {
                 dl.push(t);
@@ -62,55 +77,55 @@ pub async fn run_downloads(
 
     let counter = Arc::new(AtomicUsize::new(0));
     let total_new = to_download.len();
-    let semaphore = Arc::new(Semaphore::new(30));
 
-    let handles = to_download.into_iter().map(|task| {
-        let c = client.clone();
-        let sem = Arc::clone(&semaphore);
-        let cnt = Arc::clone(&counter);
-        async move {
-            let _permit = sem.acquire().await.unwrap();
-            let idx = cnt.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::debug!(
-                pair = %task.symbol,
-                tf = %task.timeframe,
-                date = %task.date,
-                "[{idx}/{total_new}] downloading"
-            );
-            let result = stream::download_to_file(&c, &task).await;
-            match &result {
-                Ok(()) => {
-                    mark_cached(&task);
-                    tracing::debug!(
-                        pair = %task.symbol,
-                        tf = %task.timeframe,
-                        date = %task.date,
-                        "[{idx}/{total_new}] done"
-                    );
+    let results: Vec<Result<(), AppError>> = fstream::iter(to_download)
+        .map(|task| {
+            let c = client.clone();
+            let cnt = Arc::clone(&counter);
+            async move {
+                let idx = cnt.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::debug!(
+                    pair = %task.symbol,
+                    tf = %task.timeframe,
+                    date = %task.date,
+                    "[{idx}/{total_new}] downloading"
+                );
+                let result = stream::download_to_file(&c, &task).await;
+                match &result {
+                    Ok(()) => {
+                        mark_cached(&task);
+                        tracing::debug!(
+                            pair = %task.symbol,
+                            tf = %task.timeframe,
+                            date = %task.date,
+                            "[{idx}/{total_new}] done"
+                        );
+                    }
+                    Err(AppError::NotFound { .. }) => {
+                        mark_not_found(&task);
+                        tracing::debug!(
+                            pair = %task.symbol,
+                            tf = %task.timeframe,
+                            date = %task.date,
+                            "[{idx}/{total_new}] 404 (no data)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            pair = %task.symbol,
+                            tf = %task.timeframe,
+                            date = %task.date,
+                            "[{idx}/{total_new}] failed: {e}"
+                        );
+                    }
                 }
-                Err(AppError::NotFound { .. }) => {
-                    mark_cached(&task);
-                    tracing::debug!(
-                        pair = %task.symbol,
-                        tf = %task.timeframe,
-                        date = %task.date,
-                        "[{idx}/{total_new}] 404 (no data)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        pair = %task.symbol,
-                        tf = %task.timeframe,
-                        date = %task.date,
-                        "[{idx}/{total_new}] failed: {e}"
-                    );
-                }
+                result
             }
-            result
-        }
-    });
+        })
+        .buffer_unordered(30)
+        .collect()
+        .await;
 
-    let results = join_all(handles).await;
     aggregate_results(results, total)
 }
 

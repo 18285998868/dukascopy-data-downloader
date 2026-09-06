@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use chrono::Datelike;
 use chrono::NaiveDate;
@@ -108,9 +108,9 @@ pub fn build_tasks(
     price_type: &str,
     start: NaiveDate,
     end: NaiveDate,
-    data_dir: &str,
+    data_dir: &Path,
 ) -> Vec<DownloadTask> {
-    let base = PathBuf::from(data_dir).join("dukascopy");
+    let base = data_dir.join("dukascopy");
     let mut tasks = Vec::new();
 
     for symbol in symbols {
@@ -149,7 +149,7 @@ mod tests {
             "BID",
             NaiveDate::from_ymd_opt(2025, 1, 5).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
-            "/tmp/data",
+            Path::new("/tmp/data"),
         );
         assert!(tasks.is_empty());
     }
@@ -162,7 +162,7 @@ mod tests {
             "BID",
             NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
-            "/tmp/data",
+            Path::new("/tmp/data"),
         );
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].url.contains("EURUSD/2025/BID_candles_day_1.bi5"));
@@ -183,7 +183,7 @@ mod tests {
             "ASK",
             NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
             NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
-            "/tmp/data",
+            Path::new("/tmp/data"),
         );
         assert_eq!(tasks.len(), 1);
         assert!(
@@ -208,7 +208,7 @@ mod tests {
             "BID",
             NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
-            "/tmp/data",
+            Path::new("/tmp/data"),
         );
         assert_eq!(tasks.len(), 1);
         assert!(
@@ -233,7 +233,7 @@ mod tests {
             "BID",
             NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
-            "/tmp/data",
+            Path::new("/tmp/data"),
         );
         // 2 symbols × (D1: 1 year + H1: 1 month) = 4
         assert_eq!(tasks.len(), 4);
@@ -247,7 +247,7 @@ mod tests {
             "BID",
             NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
-            "/tmp/data",
+            Path::new("/tmp/data"),
         );
         assert_eq!(tasks.len(), 3);
     }
