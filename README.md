@@ -3,6 +3,7 @@
 ## 需求分析
 
 - 项目目标: 从 [Dukascopy Datafeed](https://www.dukascopy.com/datafeed) 下载历史 K 线原始 `.bi5` 文件(LZMA 压缩,不做解码),按 `symbol × timeframe × 周期(年/月/日)` 一文件一个 `.bi5` 落地
+- 布局对齐 `binance-data-downloader`: `app/01_build_urls + 02_build_download_tasks + 03_download`, 支撑件收拢到 `utils/`; 去重用 `scan_local_files` 一次扫描, 不用 redb 下载缓存
 
 ## 技术选型
 
@@ -16,9 +17,10 @@
 symbol = ["EURUSD"] # 必填
 timeframe = ["D1"] # 可选 ["M1", "H1", "D1", "1m", "1h", "1d"]
 # price_type = "BID" # 可选 ["BID", "ASK"]
-start = "2025-01-01" # 可选, 默认 "2020-01-01"
+start = "2025-01-01" # 可选, 默认无(按 2020-01-01 处理)
 end   = "2025-01-31" # 可选, 默认 昨天
-dir   = "/tmp/dukascopy-smoke" # 可选
+output_dir = "/tmp/dukascopy-smoke" # 可选, 数据根目录(不含 dukascopy)
+# concurrency = 30 # 可选, 每配对并发数
 ```
 
 ## 逻辑编排
@@ -26,36 +28,37 @@ dir   = "/tmp/dukascopy-smoke" # 可选
 ```
 启动 -> 初始化 tracing; 解析 --config/-c
 v
-加载配置 -> toml 反序列化 + validate(symbol 非空, timeframe/price_type 白名单, start≤end)
+加载配置 -> toml 反序列化 + validate(symbol/timeframe 非空, timeframe/price_type 白名单, concurrency≠0, start≤end, sort+dedup)
 v
-构建任务 -> symbol × timeframe × 周期(年/月/日, 由 timeframe 映射) 全量 Vec<DownloadTask>
+扫描本地 -> scan_local_files(output_dir) 一次 walkdir, 收 .bi5 相对路径集 + 清 .tmp
 v
-准备 -> 建 reqwest Client(TCP 5s 探测直连 www.dukascopy.com:443 → 失败探测 SOCKS5 127.0.0.1:7890)
+准备 -> 建 reqwest Client(TCP 5s 探测直连 www.dukascopy.com:443 → 失败探测 SOCKS5 127.0.0.1:7890; 池 256)
 v
-执行下载 -> Semaphore(30) + join_all 有界并发; .bi5.tmp 流式落盘 → rename 原子生效; 404 容忍(写缓存标记)/网络·429·5xx 指数重试≤30s, 其余 4xx 永久失败; 成功·404 写 redb 缓存
+双层串行 symbol × timeframe -> run_one: build_download_tasks(起止→URL→剔本地已有) -> 03_download 并发下
 v
-汇总 -> 聚合 ok/not_found/failed; failed>0 返回 Err 否则 Ok
+执行下载 -> buffer_unordered(concurrency); .bi5.tmp 流式落盘 → rename 原子生效; 404 容忍/网络·429·5xx 指数重试≤30s, 其余 4xx 永久失败
+v
+汇总 -> DownloadStats{total/ok/not_found/failed}; failed>0 返回 Err, 配对级失败不中断后续
 ```
 
 ## 架构设计
 
 ```
-# 支撑件(cli/config/error/cache/backoff)在 crate 根, 不编号; 执行代码在 app/, 按"调用执行流程"编号: main → cli → config → 01_build_tasks → 02_run_downloads
-main.rs             # 入口: 初始化 tracing(fmt + env-filter, 缺省 info) → ddd::cli::parse() → ddd::app::run(&cli.config); 错误 anyhow 逐层加 context
-lib.rs              # 只做导出: #[path] 挂载 app/NN_* 步骤模块 + 支撑模块; pub use app::run / error::AppError
-cli.rs              # 支撑件: 命令行解析 clap 4(derive), 解析 --config/-c(必填), 返回 PathBuf
-config.rs           # 支撑件: 配置解析 toml + serde(deny_unknown_fields): symbol[]/timeframe[]/price_type/start/end(dir 默认 "data"); validate 校验(symbol 非空, timeframe/price_type 白名单, start≤end); 定义 DownloadTask{url,dest,symbol,timeframe,date,period} 与 PeriodKind
-error.rs            # 支撑件: AppError(thiserror, Config/Http/Io/NotFound/DownloadFailed/Data), #[from] 实现 ? 自动转换
-cache.rs            # 支撑件: redb 通用 KV 缓存 read/write(domain,key,ttl), 值带 8 字节时间戳前缀实现 TTL; 进程级静态 DB 池
-backoff.rs          # 支撑件: default_backoff() 指数退避, max_elapsed_time = 30s
-app/                            # 执行代码
-app/mod.rs          # 整体编排 run(config_path) (伪代码):
-                    #   1 Config::load + validate (symbol 非空, timeframe/price_type 白名单, start≤end, deny_unknown_fields)
-                    #   2 build_tasks: symbol × timeframe × 周期(年/月/日) 全量任务
-                    #   3 build_client: TCP 5s 探测直连 www.dukascopy.com:443 → 失败探测 SOCKS5 127.0.0.1:7890; 全挂 bail
-                    #   4 run_downloads(client, tasks, false) → 成功/404 写缓存, 失败聚合
-app/01_build_tasks.rs   # 构建任务: map_timeframe 映射 candles_min_1/candles_hour_1/candles_day_1 + tf_period(年/月/日); build_url 按周期生成 datafeed URL; 三层循环 → Vec<DownloadTask>
-app/02_run_downloads/   # 运行下载
-  mod.rs                # 运行下载: dest.exists/缓存过滤 → Semaphore(30) + join_all 有界并发; 成功/404 写下载缓存; 增量 [idx/total]; 聚合 ok/not_found/failed
-  stream.rs             # 单文件下载: GET → dest 父目录建链 → .bi5.tmp chunk 流式写 → flush → rename 原子落盘; 404 容忍(不重试); 网络错误/429/5xx 指数重试, 其余 4xx 永久失败
+# 对标 binance-data-downloader: app/ 三段编号, 补丁进 utils/; main → cli → config → 01_build_urls → 02_build_download_tasks → 03_download
+main.rs             # 入口: 初始化 tracing(fmt + env-filter, 缺省 info) → ddd::cli::parse() → ddd::app::run(&cli.config)
+lib.rs              # 只做导出: pub mod app/cli/config/error/utils; pub use app::run / error::AppError
+cli.rs              # 命令行解析 clap 4(derive), 解析 --config/-c(必填)
+config.rs           # AppConfig{symbol,timeframe,price_type,start?:date,end?:date,output_dir,concurrency=30} + resolved_end() + DownloadTask{url,dest,symbol,timeframe}
+error.rs            # AppError(thiserror, Http/Io/Json/Config/Api/Data/Date/Cache/DownloadFailed/NotFound/Join)
+utils/mod.rs        # pub mod backoff/cache/scan_local_files
+utils/backoff.rs    # default_backoff() 指数退避, max_elapsed_time = 30s
+utils/cache.rs      # redb 通用 KV(带 set_base_dir(output_dir/.cache)), TTL 前缀 8 字节; 当前下载链路不用, 保留占位对齐 bdd
+utils/scan_local_files.rs # walkdir 扫 .bi5 相对路径集 + 删 .tmp
+app/
+app/mod.rs          # run: AppConfig::load → cache::set_base_dir → build_client → scan_local_files → resolved_end → 串行 symbol×timeframe → run_one
+app/01_build_urls.rs      # DownloadUrl{url,rel_path,symbol,timeframe} + PeriodKind(Year/Month/Day); map_timeframe/tf_period/build_url/build_urls(单 symbol×tf, 本地 dukascopy/ 严格镜像官方 path)
+app/02_build_download_tasks.rs # build_download_tasks(symbol,tf,price,start,end,local,data_dir): build_urls → 剔 local → DownloadTask
+app/03_download/    # 有界并发下载
+  mod.rs                # DownloadStats + run_downloads(client,tasks,concurrency) → run_downloads_inner(buffer_unordered, progress 每 100, 上限 20 明细)
+  stream.rs             # 单文件: GET → 建父目录 → 清旧 .bi5.tmp → chunk 流式写 → rename; 404 Permanent, 429/5xx/网络 Transient, 余 4xx Permanent
 ```

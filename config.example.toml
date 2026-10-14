@@ -1,7 +1,17 @@
 # 配置说明: 全部字段以小写字母开头
+#
+# 目录约定 (重要): output_dir 是数据**根目录**, 程序会自动在其下追加
+#   dukascopy/{symbol}/{YYYY}[/{MM}[/{DD}]]/{price}_{candles_*}.bi5
+# 因此不要把 dukascopy 写进 output_dir, 否则会生成重复的嵌套目录:
+#   错误: output_dir = "/data/dukascopy"
+#         → /data/dukascopy/dukascopy/...
+#   正确: output_dir = "/data"
+#         → /data/dukascopy/...
+#
 symbol = ["EURUSD"] # 交易品种列表, 必填
 timeframe = ["D1"] # K线周期, 必填, 可选参数: ["M1","H1","D1","1m","1h","1d"]
 # price_type = "BID" # 报价类型, 可选, 默认值: "BID", 可选参数: ["BID","ASK"]
-# start = "2020-01-01" # 起始日期, 可选, 默认值: "2020-01-01", 可选参数: YYYY-MM-DD
+# start = "2020-01-01" # 起始日期, 可选, 默认值: 无(按 2020-01-01 处理), 可选参数: YYYY-MM-DD
 # end = "2025-12-31" # 截止日期, 可选, 默认值: 昨天, 可选参数: YYYY-MM-DD
-# dir = "data" # 输出目录, 可选, 默认值: "data", 可选参数: 任意目录路径
+# output_dir = "data" # 数据根目录(不含 dukascopy), 可选, 默认值: "data", 可选参数: 任意目录路径
+# concurrency = 30 # 每个 (symbol × timeframe) 配对内的最大并发下载数, 可选, 默认值: 30, 可选参数: 正整数(≠0)

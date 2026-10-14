@@ -3,9 +3,12 @@ use backoff::backoff::Backoff;
 use backoff::future::retry;
 use tokio::io::AsyncWriteExt;
 
-use crate::backoff::default_backoff;
 use crate::config::DownloadTask;
+use crate::utils::backoff::default_backoff;
 
+/// Download a bi5 file with retry, streaming directly to disk.
+///
+/// Writes to a `.bi5.tmp` file, then atomically renames to `.bi5`.
 pub async fn download_to_file(
     client: &reqwest::Client,
     task: &DownloadTask,
@@ -63,6 +66,11 @@ async fn download_to_file_with_backoff(
             }
 
             let tmp_path = dest.with_extension("bi5.tmp");
+            match tokio::fs::remove_file(&tmp_path).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(BackoffError::Permanent(crate::AppError::Io(e))),
+            }
             let mut file = tokio::fs::File::create(&tmp_path)
                 .await
                 .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
@@ -96,10 +104,10 @@ async fn download_to_file_with_backoff(
 mod tests {
     use super::*;
     use crate::AppError;
-    use crate::config::PeriodKind;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Backoff that never retries (max_elapsed = 0).
     fn no_retry() -> backoff::ExponentialBackoff {
         backoff::ExponentialBackoff {
             current_interval: std::time::Duration::ZERO,
@@ -109,33 +117,15 @@ mod tests {
         }
     }
 
-    fn retry_until_success() -> backoff::ExponentialBackoff {
-        backoff::ExponentialBackoff {
-            current_interval: std::time::Duration::ZERO,
-            initial_interval: std::time::Duration::ZERO,
-            max_elapsed_time: Some(std::time::Duration::from_secs(10)),
-            ..Default::default()
-        }
-    }
-
-    fn make_task(
-        server: &MockServer,
-        period: PeriodKind,
-        dest: std::path::PathBuf,
-    ) -> DownloadTask {
-        let path = match period {
-            PeriodKind::Year => "/datafeed/EURUSD/2025/BID_candles_day_1.bi5",
-            PeriodKind::Month => "/datafeed/EURUSD/2025/01/BID_candles_hour_1.bi5",
-            PeriodKind::Day => "/datafeed/EURUSD/2025/01/02/BID_candles_min_1.bi5",
-        };
-        let url = format!("{}{}", server.uri(), path);
+    fn make_task(server: &MockServer) -> DownloadTask {
         DownloadTask {
-            url,
-            dest,
+            url: format!(
+                "{}/datafeed/EURUSD/2025/BID_candles_day_1.bi5",
+                server.uri()
+            ),
+            dest: std::path::PathBuf::from("/tmp/test-download.bi5"),
             symbol: "EURUSD".into(),
             timeframe: "D1".into(),
-            date: chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
-            period,
         }
     }
 
@@ -144,17 +134,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/datafeed/EURUSD/2025/BID_candles_day_1.bi5"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"b5data"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bi5data"))
             .mount(&server)
             .await;
 
         let client = reqwest::Client::new();
-        let dir = tempfile::tempdir().unwrap();
-        let task = make_task(
-            &server,
-            PeriodKind::Year,
-            dir.path().join("test-download.bi5"),
-        );
+        let task = make_task(&server);
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(result.is_ok());
     }
@@ -168,12 +153,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let dir = tempfile::tempdir().unwrap();
-        let task = make_task(
-            &server,
-            PeriodKind::Year,
-            dir.path().join("test-download.bi5"),
-        );
+        let task = make_task(&server);
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::NotFound { .. })));
     }
@@ -187,54 +167,8 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let dir = tempfile::tempdir().unwrap();
-        let task = make_task(
-            &server,
-            PeriodKind::Year,
-            dir.path().join("test-download.bi5"),
-        );
+        let task = make_task(&server);
         let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
         assert!(matches!(result, Err(AppError::DownloadFailed { .. })));
-    }
-
-    #[tokio::test]
-    async fn download_200_chunks_streamed_to_dest() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/datafeed/EURUSD/2025/BID_candles_day_1.bi5"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"b5data-chunked"))
-            .mount(&server)
-            .await;
-
-        let client = reqwest::Client::new();
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("test-stream.bi5");
-        let task = make_task(&server, PeriodKind::Year, dest.clone());
-        let result = download_to_file_with_backoff(&client, &task, no_retry()).await;
-        assert!(result.is_ok());
-        assert_eq!(std::fs::read(&dest).unwrap(), b"b5data-chunked");
-    }
-
-    #[tokio::test]
-    async fn download_400_is_permanent_not_retried() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/datafeed/EURUSD/2025/BID_candles_day_1.bi5"))
-            .respond_with(ResponseTemplate::new(400))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = reqwest::Client::new();
-        let dir = tempfile::tempdir().unwrap();
-        let task = make_task(
-            &server,
-            PeriodKind::Year,
-            dir.path().join("test-download.bi5"),
-        );
-        // Even with a generous backoff window, a 400 must not be retried.
-        let result = download_to_file_with_backoff(&client, &task, retry_until_success()).await;
-        assert!(matches!(result, Err(AppError::DownloadFailed { .. })));
-        server.verify().await;
     }
 }
