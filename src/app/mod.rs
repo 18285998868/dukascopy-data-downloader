@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::AppError;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Timeframe};
 
 /// Run the full batch download pipeline.
 ///
@@ -19,9 +19,8 @@ use crate::config::AppConfig;
 /// 3. Iterate symbol (serial) → timeframe (serial), downloading missing files
 pub async fn run(config_path: &Path) -> Result<(), AppError> {
     let cfg = AppConfig::load(config_path)?;
-    crate::utils::cache::set_base_dir(&cfg.output_dir)?;
 
-    let client = build_client().await?;
+    let client = build_client()?;
 
     let local = crate::utils::scan_local_files::scan_local_files(&cfg.output_dir).await?;
 
@@ -49,7 +48,7 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
                 cfg: &cfg,
                 local: &local,
             };
-            if let Err(e) = run_one(&client, symbol, timeframe, &ctx).await {
+            if let Err(e) = run_one(&client, symbol, *timeframe, &ctx).await {
                 failed_pairs += 1;
                 tracing::error!(symbol = %symbol, timeframe = %timeframe, "failed: {e}");
                 if errors.len() < MAX_BATCH_ERRORS {
@@ -93,7 +92,7 @@ struct PairCtx<'a> {
 async fn run_one(
     client: &reqwest::Client,
     symbol: &str,
-    timeframe: &str,
+    timeframe: Timeframe,
     ctx: &PairCtx<'_>,
 ) -> Result<(), AppError> {
     if ctx.start > ctx.end {
@@ -118,7 +117,7 @@ async fn run_one(
     let tasks = build_download_tasks::build_download_tasks(
         symbol,
         timeframe,
-        &ctx.cfg.price_type,
+        ctx.cfg.price_type,
         ctx.start,
         ctx.end,
         ctx.local,
@@ -155,46 +154,12 @@ async fn run_one(
     Ok(())
 }
 
-/// Build a client that tries direct first, then falls back to SOCKS5 proxy.
-async fn build_client() -> Result<reqwest::Client, AppError> {
-    fn base_builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder()
-            .user_agent("dukascopy-data-downloader/0.1")
-            .pool_max_idle_per_host(256)
-            .pool_idle_timeout(Duration::from_secs(30))
-    }
-
-    let direct = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect("www.dukascopy.com:443"),
-    )
-    .await
-    .ok()
-    .and_then(|r| r.ok());
-
-    if direct.is_some() {
-        return Ok(base_builder().timeout(Duration::from_secs(30)).build()?);
-    }
-
-    let proxy = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect("127.0.0.1:7890"),
-    )
-    .await
-    .ok()
-    .and_then(|r| r.ok());
-
-    if proxy.is_some() {
-        return Ok(base_builder()
-            .timeout(Duration::from_secs(60))
-            .proxy(
-                reqwest::Proxy::all("socks5h://127.0.0.1:7890")
-                    .map_err(|e| AppError::Config(format!("invalid proxy: {e}")))?,
-            )
-            .build()?);
-    }
-
-    Err(AppError::Data(
-        "no network (tried direct and SOCKS5 proxy at 127.0.0.1:7890)".into(),
-    ))
+/// Build a direct-connection client (no proxy).
+fn build_client() -> Result<reqwest::Client, AppError> {
+    Ok(reqwest::Client::builder()
+        .user_agent("dukascopy-data-downloader/0.1")
+        .pool_max_idle_per_host(256)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
+        .build()?)
 }

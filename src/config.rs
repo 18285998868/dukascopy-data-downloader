@@ -1,20 +1,94 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::Deserialize;
 
 use crate::AppError;
 
-/// Accepted timeframe values, mapped to Dukascopy candles_* URL segments.
-const VALID_TIMEFRAMES: [&str; 6] = ["M1", "H1", "D1", "1m", "1h", "1d"];
+/// Canonical timeframe. Aliases (`1m`/`1h`/`1d`) parse to the same variant,
+/// so `["M1", "1m"]` dedups instead of downloading twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Timeframe {
+    M1,
+    H1,
+    D1,
+}
 
-const VALID_PRICE_TYPES: [&str; 2] = ["BID", "ASK"];
+impl FromStr for Timeframe {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "M1" | "1m" => Ok(Self::M1),
+            "H1" | "1h" => Ok(Self::H1),
+            "D1" | "1d" => Ok(Self::D1),
+            _ => Err(format!(
+                "unsupported timeframe: {s}, valid values: [\"M1\", \"H1\", \"D1\", \"1m\", \"1h\", \"1d\"]"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for Timeframe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::M1 => write!(f, "M1"),
+            Self::H1 => write!(f, "H1"),
+            Self::D1 => write!(f, "D1"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Timeframe {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Canonical price type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PriceType {
+    #[default]
+    Bid,
+    Ask,
+}
+
+impl FromStr for PriceType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "BID" => Ok(Self::Bid),
+            "ASK" => Ok(Self::Ask),
+            _ => Err(format!(
+                "unsupported price type: {s}, valid values: [\"BID\", \"ASK\"]"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for PriceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bid => write!(f, "BID"),
+            Self::Ask => write!(f, "ASK"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PriceType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub symbol: Vec<String>,
-    pub timeframe: Vec<String>,
-    pub price_type: String,
+    pub timeframe: Vec<Timeframe>,
+    pub price_type: PriceType,
     pub start: Option<chrono::NaiveDate>,
     pub end: Option<chrono::NaiveDate>,
     pub output_dir: PathBuf,
@@ -26,7 +100,7 @@ impl Default for AppConfig {
         Self {
             symbol: Vec::new(),
             timeframe: Vec::new(),
-            price_type: "BID".into(),
+            price_type: PriceType::Bid,
             start: None,
             end: None,
             output_dir: PathBuf::from("data"),
@@ -34,6 +108,11 @@ impl Default for AppConfig {
         }
     }
 }
+
+/// Upper bound for per-pair concurrency (aligned with client pool).
+const MAX_CONCURRENCY: usize = 256;
+/// Upper bound for an explicit start..=end range (fail fast on typos like year 9999).
+const MAX_RANGE_DAYS: i64 = 366 * 15;
 
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self, AppError> {
@@ -47,7 +126,7 @@ impl AppConfig {
     /// Resolve the download end date: `min(config.end, yesterday)`.
     /// Computed once by the caller; downstream only consumes the value.
     pub fn resolved_end(&self, today: chrono::NaiveDate) -> chrono::NaiveDate {
-        let yesterday = today - chrono::Duration::days(1);
+        let yesterday = today.pred_opt().unwrap_or(today);
         self.end.map(|e| e.min(yesterday)).unwrap_or(yesterday)
     }
 
@@ -62,32 +141,28 @@ impl AppConfig {
                 "timeframe must contain at least one timeframe".into(),
             ));
         }
-        if let Some(bad) = self
-            .timeframe
-            .iter()
-            .find(|tf| !VALID_TIMEFRAMES.contains(&tf.as_str()))
-        {
-            return Err(AppError::Config(format!(
-                "unsupported timeframe: {bad}, valid values: {VALID_TIMEFRAMES:?}"
-            )));
-        }
-        if !VALID_PRICE_TYPES.contains(&self.price_type.as_str()) {
-            return Err(AppError::Config(format!(
-                "unsupported price type: {}, valid values: {VALID_PRICE_TYPES:?}",
-                self.price_type
-            )));
-        }
         if self.concurrency == 0 {
             return Err(AppError::Config(
                 "concurrency must be greater than zero".into(),
             ));
         }
-        if let (Some(start), Some(end)) = (self.start, self.end)
-            && start > end
-        {
+        if self.concurrency > MAX_CONCURRENCY {
             return Err(AppError::Config(format!(
-                "start {start} is after end {end}"
+                "concurrency {} exceeds maximum {MAX_CONCURRENCY}",
+                self.concurrency
             )));
+        }
+        if let (Some(start), Some(end)) = (self.start, self.end) {
+            if start > end {
+                return Err(AppError::Config(format!(
+                    "start {start} is after end {end}"
+                )));
+            }
+            if (end - start).num_days() > MAX_RANGE_DAYS {
+                return Err(AppError::Config(format!(
+                    "date range {start}..={end} exceeds maximum {MAX_RANGE_DAYS} days"
+                )));
+            }
         }
         self.symbol.sort();
         self.symbol.dedup();
@@ -103,7 +178,7 @@ pub struct DownloadTask {
     pub url: String,
     pub dest: PathBuf,
     pub symbol: String,
-    pub timeframe: String,
+    pub timeframe: Timeframe,
 }
 
 #[cfg(test)]
@@ -138,8 +213,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.symbol, vec!["EURUSD", "GBPUSD"]);
-        assert_eq!(cfg.timeframe, vec!["D1", "H1"]);
-        assert_eq!(cfg.price_type, "ASK");
+        assert_eq!(cfg.timeframe, vec![Timeframe::H1, Timeframe::D1]);
+        assert_eq!(cfg.price_type, PriceType::Ask);
         assert_eq!(
             cfg.start,
             Some(chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
@@ -156,12 +231,19 @@ mod tests {
     fn load_minimal_config() {
         let cfg = load("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
         assert_eq!(cfg.symbol, vec!["EURUSD"]);
-        assert_eq!(cfg.timeframe, vec!["D1"]);
-        assert_eq!(cfg.price_type, "BID");
+        assert_eq!(cfg.timeframe, vec![Timeframe::D1]);
+        assert_eq!(cfg.price_type, PriceType::Bid);
         assert_eq!(cfg.start, None);
         assert_eq!(cfg.end, None);
         assert_eq!(cfg.output_dir, PathBuf::from("data"));
         assert_eq!(cfg.concurrency, 30);
+    }
+
+    #[test]
+    fn timeframe_aliases_normalize_and_dedup() {
+        let cfg =
+            load("symbol = [\"EURUSD\"]\ntimeframe = [\"M1\", \"1m\", \"1h\", \"H1\"]").unwrap();
+        assert_eq!(cfg.timeframe, vec![Timeframe::M1, Timeframe::H1]);
     }
 
     #[test]
@@ -205,6 +287,23 @@ mod tests {
     fn zero_concurrency_fails() {
         let err = load("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nconcurrency = 0").unwrap_err();
         assert!(err.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn excessive_concurrency_fails() {
+        let err =
+            load("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nconcurrency = 10000").unwrap_err();
+        assert!(err.to_string().contains("concurrency"));
+    }
+
+    #[test]
+    fn excessive_range_fails() {
+        let err = load(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\n\
+             start = \"2020-01-01\"\nend = \"9999-12-31\"",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("range"));
     }
 
     #[test]
@@ -257,7 +356,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.symbol, vec!["EURUSD", "GBPUSD"]);
-        assert_eq!(cfg.timeframe, vec!["D1", "H1"]);
+        assert_eq!(cfg.timeframe, vec![Timeframe::H1, Timeframe::D1]);
     }
 
     #[test]

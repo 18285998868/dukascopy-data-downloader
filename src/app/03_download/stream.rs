@@ -125,7 +125,7 @@ mod tests {
             ),
             dest: std::path::PathBuf::from("/tmp/test-download.bi5"),
             symbol: "EURUSD".into(),
-            timeframe: "D1".into(),
+            timeframe: crate::config::Timeframe::D1,
         }
     }
 

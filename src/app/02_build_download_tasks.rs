@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::build_urls::build_urls;
-use crate::config::DownloadTask;
+use crate::config::{DownloadTask, PriceType, Timeframe};
 
 /// Build a list of DownloadTasks for a date range, skipping locally-present files.
 pub fn build_download_tasks(
     symbol: &str,
-    timeframe: &str,
-    price_type: &str,
+    timeframe: Timeframe,
+    price_type: PriceType,
     start: chrono::NaiveDate,
     end: chrono::NaiveDate,
     local: &HashSet<String>,
@@ -38,8 +38,8 @@ mod tests {
     fn build_tasks_all_missing() {
         let tasks = build_download_tasks(
             "EURUSD",
-            "D1",
-            "BID",
+            Timeframe::D1,
+            PriceType::Bid,
             date(2025, 1, 1),
             date(2025, 1, 2),
             &HashSet::new(),
@@ -57,8 +57,8 @@ mod tests {
         local.insert("dukascopy/EURUSD/2025/BID_candles_day_1.bi5".into());
         let tasks = build_download_tasks(
             "EURUSD",
-            "D1",
-            "BID",
+            Timeframe::D1,
+            PriceType::Bid,
             date(2025, 1, 1),
             date(2025, 1, 2),
             &local,
@@ -73,8 +73,8 @@ mod tests {
         local.insert("dukascopy/EURUSD/2025/01/01/BID_candles_min_1.bi5".into());
         let tasks = build_download_tasks(
             "EURUSD",
-            "M1",
-            "BID",
+            Timeframe::M1,
+            PriceType::Bid,
             date(2025, 1, 1),
             date(2025, 1, 2),
             &local,
@@ -88,8 +88,8 @@ mod tests {
     fn build_tasks_empty_range() {
         let tasks = build_download_tasks(
             "EURUSD",
-            "M1",
-            "BID",
+            Timeframe::M1,
+            PriceType::Bid,
             date(2025, 6, 1),
             date(2025, 5, 31),
             &HashSet::new(),
