@@ -4,7 +4,7 @@ use chrono::NaiveDate;
 use crate::config::{PriceType, Timeframe};
 
 /// A download URL with its relative storage path and metadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadUrl {
     pub url: String,
     pub rel_path: String,
@@ -25,7 +25,8 @@ pub enum PeriodKind {
     Day,
 }
 
-pub fn map_timeframe(tf: Timeframe) -> &'static str {
+/// Map a timeframe to its server-side file stem.
+pub(crate) const fn map_timeframe(tf: Timeframe) -> &'static str {
     match tf {
         Timeframe::M1 => "candles_min_1",
         Timeframe::H1 => "candles_hour_1",
@@ -33,7 +34,8 @@ pub fn map_timeframe(tf: Timeframe) -> &'static str {
     }
 }
 
-pub fn tf_period(tf: Timeframe) -> PeriodKind {
+/// Map a timeframe to its calendar bucket granularity.
+pub(crate) const fn tf_period(tf: Timeframe) -> PeriodKind {
     match tf {
         Timeframe::D1 => PeriodKind::Year,
         Timeframe::H1 => PeriodKind::Month,
@@ -41,7 +43,8 @@ pub fn tf_period(tf: Timeframe) -> PeriodKind {
     }
 }
 
-pub fn build_url(
+/// Build a single download URL for the given date and period.
+pub(crate) fn build_url(
     symbol: &str,
     price_type: PriceType,
     tf: Timeframe,
@@ -72,7 +75,7 @@ fn build_date_range(start: NaiveDate, end: NaiveDate, period: PeriodKind) -> Vec
             let y0 = start.year();
             let y1 = end.year();
             (y0..=y1)
-                .map(|y| NaiveDate::from_ymd_opt(y, 1, 1).unwrap())
+                .map(|y| NaiveDate::from_ymd_opt(y, 1, 1).expect("valid year boundary"))
                 .collect()
         }
         PeriodKind::Month => {
@@ -82,7 +85,7 @@ fn build_date_range(start: NaiveDate, end: NaiveDate, period: PeriodKind) -> Vec
             let end_y = end.year();
             let end_m = end.month();
             loop {
-                dates.push(NaiveDate::from_ymd_opt(y, m, 1).unwrap());
+                dates.push(NaiveDate::from_ymd_opt(y, m, 1).expect("valid month boundary"));
                 if y == end_y && m >= end_m {
                     break;
                 }

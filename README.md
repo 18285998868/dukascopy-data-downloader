@@ -18,7 +18,7 @@
 
 - rust
 - edition = "2024"
-- 网络: reqwest（直连，失败自动回退 SOCKS5 `127.0.0.1:7890`）
+- 网络: reqwest（直连）
 
 ## 冒烟配置
 
@@ -38,7 +38,7 @@ main.rs         入口, 初始化tracing, 解析参数 --config/-c 并将其传�
 app/            逻辑处理, 根据配置构建下载 urls -> 执行下载
                 01加载配置
                 扫描本地已有 .bi5(同遍清 .tmp)
-                建 reqwest Client(TCP 5s 探测直连 www.dukascopy.com:443 → 失败切 SOCKS5 127.0.0.1:7890)
+                建 reqwest Client(直连 Dukascopy，30s 超时，连接池每主机 256 空闲连接；不启用代理回退)
                 for symbol in config.symbol
                   for timeframe in config.timeframe
                     按 timeframe 映射周期(年/月/日)构建从 start 到 end 的下载链接列表 urls,格式: {symbol}/{YYYY}[/{MM}[/{DD}]]/{PRICE}_{candles_*}.bi5
@@ -89,9 +89,9 @@ app/
 8. concurrency≠0。
 9. 双 Some 且 start>end 报错；另附归一化：双列表 sort+dedup。
 
-#### 建 reqwest Client（直连优先，代理回退，池 256）
+#### 建 reqwest Client（直连，池 256）
 
-TCP 5s 探测直连 `www.dukascopy.com:443` 成功用 30s 超时直连；否则 5s 探测 `127.0.0.1:7890` 成功用 60s 超时 + `socks5h` 代理；都不通直接返 `Data(no network)`。
+直连 Dukascopy，30s 超时，连接池每主机 256 空闲连接；不启用代理回退。
 
 #### end 处理
 
@@ -120,7 +120,7 @@ end=cfg.resolved_end(今天)（min(end,昨天)/缺省昨天）
   - 解决: 增加重试机制,确保数据下载成功;404 单次即止记容忍,不重试
   - 文件: `src/utils/backoff.rs`
 - 当直连被墙或超时时,会全批失败,
-  - 解决: TCP 5s 探测直连,失败自动切 SOCKS5 `127.0.0.1:7890`;全挂直接报错不空跑
+  - 现状: 直连 Dukascopy，30s 超时，连接池每主机 256；不启用代理回退（如需代理请自行配置环境）
   - 文件: `src/app/mod.rs:build_client`
 - 当配置写重复或写错时,会误下或空跑,
   - 解决: `symbol/timeframe` 排序去重;报错带文件路径;未知键拒收(`deny_unknown_fields`)
@@ -141,7 +141,6 @@ app/
 utils/
   mod.rs 聚合入口
   scan_local_files.rs
-  cache.rs (redb, 保留占位对齐 bdd, 当前下载链路不用)
   backoff.rs
 ```
 
@@ -195,10 +194,8 @@ timeframe = ["D1"] # 必填，非空，6 值白名单 ["M1","H1","D1","1m","1h",
   - 单文件：GET → 404 永久 `NotFound` 不重试 → 429/5xx/网络瞬态指数退避（30s 上限）→ 其余 4xx 永久失败
   - 建父目录 → 清旧 `.bi5.tmp` → 流式写 `.bi5.tmp` → `flush` → `rename` 原子落盘
 - utils/mod.rs
-  - 聚合入口：`backoff/cache/scan_local_files`
+  - 聚合入口：`backoff/scan_local_files`
 - utils/scan_local_files.rs
   - `spawn_blocking + walkdir` 遍历，得相对 `.bi5` 集合；目录不存在返空；同遍删 `.tmp`
-- utils/cache.rs
-  - `redb` 通用 KV（`output_dir/.cache/{domain}/`，未设时走 `~/.cache/`），值带 8 字节时间戳，读时判 TTL；保留对齐 bdd，当前下载链路不用
 - utils/backoff.rs
   - 指数退避，`max_elapsed_time = 30s`

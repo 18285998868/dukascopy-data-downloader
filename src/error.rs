@@ -3,33 +3,43 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppError {
-    #[error("HTTP error: {0}")]
+    /// HTTP transport error.
+    #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("I/O error: {0}")]
+    /// I/O error.
+    #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("JSON error: {0}")]
+    /// JSON (de)serialization error.
+    #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Config error: {0}")]
+    /// Configuration error.
+    #[error("config error: {0}")]
     Config(String),
 
-    #[error("API error: {0}")]
+    /// API-level error.
+    #[error("api error: {0}")]
     Api(String),
 
-    #[error("Data error: {0}")]
+    /// Data processing error.
+    #[error("data error: {0}")]
     Data(String),
 
-    #[error("Date error: {0}")]
+    /// Date handling error.
+    #[error("date error: {0}")]
     Date(String),
 
-    #[error("Download failed for {url}: {reason}")]
+    /// A download failed.
+    #[error("download failed for {url}: {reason}")]
     DownloadFailed { url: String, reason: String },
 
+    /// Requested resource was not found (HTTP 404).
     #[error("not found: {url}")]
     NotFound { url: String },
 
-    #[error("Task join error: {0}")]
+    /// Tokio task join error.
+    #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 }

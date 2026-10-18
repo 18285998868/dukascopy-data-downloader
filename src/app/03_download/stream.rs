@@ -9,6 +9,10 @@ use crate::utils::backoff::default_backoff;
 /// Download a bi5 file with retry, streaming directly to disk.
 ///
 /// Writes to a `.bi5.tmp` file, then atomically renames to `.bi5`.
+///
+/// # Errors
+///
+/// Returns [`crate::AppError`] on HTTP, I/O, or retry exhaustion.
 pub async fn download_to_file(
     client: &reqwest::Client,
     task: &DownloadTask,
@@ -67,7 +71,7 @@ async fn download_to_file_with_backoff(
 
             let tmp_path = dest.with_extension("bi5.tmp");
             match tokio::fs::remove_file(&tmp_path).await {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(BackoffError::Permanent(crate::AppError::Io(e))),
             }

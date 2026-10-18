@@ -17,6 +17,11 @@ use crate::config::{AppConfig, Timeframe};
 /// 1. Load config
 /// 2. Scan existing local files (once)
 /// 3. Iterate symbol (serial) → timeframe (serial), downloading missing files
+///
+/// # Errors
+///
+/// Returns [`AppError`] if configuration loading, client construction, scanning,
+/// or any download pair fails.
 pub async fn run(config_path: &Path) -> Result<(), AppError> {
     let cfg = AppConfig::load(config_path)?;
 
@@ -25,8 +30,8 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
     let local = crate::utils::scan_local_files::scan_local_files(&cfg.output_dir).await?;
 
     let concurrency = cfg.concurrency;
-    let end = cfg.resolved_end(chrono::Local::now().date_naive());
-    let start_default = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+    let end = cfg.resolved_end(chrono::Utc::now().date_naive());
+    let start_default = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("valid default date");
     let start_cfg = cfg.start.unwrap_or(start_default);
 
     tracing::info!(
@@ -50,7 +55,7 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
             };
             if let Err(e) = run_one(&client, symbol, *timeframe, &ctx).await {
                 failed_pairs += 1;
-                tracing::error!(symbol = %symbol, timeframe = %timeframe, "failed: {e}");
+                tracing::error!(symbol = %symbol, timeframe = %timeframe, error = %e, "pair failed");
                 if errors.len() < MAX_BATCH_ERRORS {
                     errors.push(format!("{symbol}/{timeframe}: {e}"));
                 }

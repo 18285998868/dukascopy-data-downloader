@@ -1,5 +1,13 @@
 //! Dukascopy historical kline downloader (.bi5 raw files).
 //!
+#![warn(
+    clippy::correctness,
+    clippy::suspicious,
+    clippy::style,
+    clippy::complexity,
+    clippy::perf
+)]
+//!
 //! Module layout: `app/` holds the naive pipeline (`01_build_urls`,
 //! `02_build_download_tasks`, `03_download/`); patches live in `utils/`
 //! (`scan_local_files`, `backoff`).

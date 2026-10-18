@@ -9,6 +9,7 @@ use crate::AppError;
 /// Canonical timeframe. Aliases (`1m`/`1h`/`1d`) parse to the same variant,
 /// so `["M1", "1m"]` dedups instead of downloading twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Timeframe {
     M1,
     H1,
@@ -16,15 +17,15 @@ pub enum Timeframe {
 }
 
 impl FromStr for Timeframe {
-    type Err = String;
+    type Err = crate::AppError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "M1" | "1m" => Ok(Self::M1),
             "H1" | "1h" => Ok(Self::H1),
             "D1" | "1d" => Ok(Self::D1),
-            _ => Err(format!(
+            _ => Err(crate::AppError::Config(format!(
                 "unsupported timeframe: {s}, valid values: [\"M1\", \"H1\", \"D1\", \"1m\", \"1h\", \"1d\"]"
-            )),
+            ))),
         }
     }
 }
@@ -48,6 +49,7 @@ impl<'de> Deserialize<'de> for Timeframe {
 
 /// Canonical price type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum PriceType {
     #[default]
     Bid,
@@ -55,14 +57,14 @@ pub enum PriceType {
 }
 
 impl FromStr for PriceType {
-    type Err = String;
+    type Err = crate::AppError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "BID" => Ok(Self::Bid),
             "ASK" => Ok(Self::Ask),
-            _ => Err(format!(
+            _ => Err(crate::AppError::Config(format!(
                 "unsupported price type: {s}, valid values: [\"BID\", \"ASK\"]"
-            )),
+            ))),
         }
     }
 }
@@ -83,8 +85,10 @@ impl<'de> Deserialize<'de> for PriceType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Application configuration loaded from TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AppConfig {
     pub symbol: Vec<String>,
     pub timeframe: Vec<Timeframe>,
@@ -115,6 +119,11 @@ const MAX_CONCURRENCY: usize = 256;
 const MAX_RANGE_DAYS: i64 = 366 * 15;
 
 impl AppConfig {
+    /// Load and validate configuration from `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Config`] if the file cannot be read, parsed, or validated.
     pub fn load(path: &Path) -> Result<Self, AppError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| AppError::Config(format!("{}: {e}", path.display())))?;
@@ -124,6 +133,7 @@ impl AppConfig {
     }
 
     /// Resolve the download end date: `min(config.end, yesterday)`.
+    ///
     /// Computed once by the caller; downstream only consumes the value.
     pub fn resolved_end(&self, today: chrono::NaiveDate) -> chrono::NaiveDate {
         let yesterday = today.pred_opt().unwrap_or(today);
@@ -134,6 +144,20 @@ impl AppConfig {
         if self.symbol.is_empty() {
             return Err(AppError::Config(
                 "symbol must contain at least one symbol".into(),
+            ));
+        }
+        if self.symbol.iter().any(|s| s.trim().is_empty()) {
+            return Err(AppError::Config(
+                "symbol must not contain empty values".into(),
+            ));
+        }
+        if self
+            .symbol
+            .iter()
+            .any(|s| s.contains('/') || s.contains('\\') || s == "..")
+        {
+            return Err(AppError::Config(
+                "symbol must not contain path separators or '..'".into(),
             ));
         }
         if self.timeframe.is_empty() {
@@ -173,7 +197,7 @@ impl AppConfig {
 }
 
 /// A download task: source URL, destination path and identifying metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadTask {
     pub url: String,
     pub dest: PathBuf,

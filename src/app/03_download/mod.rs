@@ -13,7 +13,7 @@ const PROGRESS_EVERY: usize = 100;
 const MAX_LOGGED_FAILURES: usize = 20;
 
 /// Aggregate statistics for a completed batch of downloads.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DownloadStats {
     pub total: usize,
     pub ok: usize,
@@ -22,12 +22,16 @@ pub struct DownloadStats {
 }
 
 impl DownloadStats {
-    fn done(&self) -> usize {
+    const fn done(&self) -> usize {
         self.ok + self.not_found + self.failed
     }
 }
 
 /// Download all tasks with bounded concurrency.
+///
+/// # Errors
+///
+/// Returns [`AppError::DownloadFailed`] if any download fails or all tasks are not found.
 pub async fn run_downloads(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
@@ -84,12 +88,12 @@ where
                 stats.failed += 1;
                 if logged_failures < MAX_LOGGED_FAILURES {
                     logged_failures += 1;
-                    tracing::warn!("download failed: {e}");
+                    tracing::warn!(error = %e, "download failed");
                 }
             }
         }
 
-        if stats.done().is_multiple_of(PROGRESS_EVERY) {
+        if stats.done() % PROGRESS_EVERY == 0 {
             tracing::info!(
                 done = stats.done(),
                 total = stats.total,

@@ -4,7 +4,12 @@ use std::path::Path;
 use crate::AppError;
 
 /// Scan data_dir for existing .bi5 files.
+///
 /// Also removes stale .tmp files during the same walk.
+///
+/// # Errors
+///
+/// Returns [`AppError::Join`] if the blocking task panics.
 pub async fn scan_local_files(data_dir: &Path) -> Result<HashSet<String>, AppError> {
     let dir = data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -16,14 +21,17 @@ pub async fn scan_local_files(data_dir: &Path) -> Result<HashSet<String>, AppErr
             let e = match e {
                 Ok(e) => e,
                 Err(err) => {
-                    tracing::warn!(path = %dir.display(), "walkdir entry failed: {err}");
+                    tracing::warn!(path = %dir.display(), error = %err, "walkdir entry failed");
                     continue;
                 }
             };
             if !e.file_type().is_file() {
                 continue;
             }
-            let rel = e.path().strip_prefix(&dir).unwrap_or(e.path());
+            let Ok(rel) = e.path().strip_prefix(&dir) else {
+                tracing::warn!(path = %e.path().display(), "entry outside scan root, skipped");
+                continue;
+            };
             let s = rel.to_string_lossy();
 
             if s.ends_with(".tmp") {

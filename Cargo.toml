@@ -4,6 +4,7 @@
 name = "dukascopy-data-downloader"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["NautilusTrader Developer"]
 license = "MIT"
 
