@@ -5,7 +5,7 @@ name = "dukascopy-data-downloader"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-authors = ["NautilusTrader Developer"]
+description = "Download raw Dukascopy historical kline (.bi5) files from the public Datafeed."
 license = "MIT"
 
 [lib]
@@ -13,11 +13,12 @@ name = "ddd"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Narrow feature set: rt-multi-thread (#[tokio::main]), macros (#[tokio::test]),
+# fs (tokio::fs), time (test sleeps), sync (Semaphore download gate).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 toml = "1.1"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
