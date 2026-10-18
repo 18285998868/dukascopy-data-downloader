@@ -87,16 +87,31 @@ impl<'de> Deserialize<'de> for PriceType {
 
 /// Application configuration loaded from TOML.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct AppConfig {
     pub symbol: Vec<String>,
     pub timeframe: Vec<Timeframe>,
+    #[serde(default)]
     pub price_type: PriceType,
+    #[serde(default)]
     pub start: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub start_default: Option<chrono::NaiveDate>,
+    #[serde(default)]
     pub end: Option<chrono::NaiveDate>,
+    #[serde(default = "default_output_dir")]
     pub output_dir: PathBuf,
+    #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+}
+
+fn default_output_dir() -> PathBuf {
+    PathBuf::from("data")
+}
+
+fn default_concurrency() -> usize {
+    30
 }
 
 impl Default for AppConfig {
@@ -106,6 +121,7 @@ impl Default for AppConfig {
             timeframe: Vec::new(),
             price_type: PriceType::Bid,
             start: None,
+            start_default: None,
             end: None,
             output_dir: PathBuf::from("data"),
             concurrency: 30,

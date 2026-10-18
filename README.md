@@ -175,7 +175,7 @@ timeframe = ["D1"] # 必填，非空，6 值白名单 ["M1","H1","D1","1m","1h",
   - `resolved_end(today)`：`min(end,昨天)`/缺省昨天，调用方算一次
   - `DownloadTask{url, dest, symbol, timeframe}` 定义在此
 - error.rs
-  - `AppError`（thiserror）：Config/Api/Data/Date/Cache/Http/Io/Json/DownloadFailed/NotFound/Join
+  - `AppError`（thiserror）：Config/Api/Data/Date/Http/Io/Json/DownloadFailed/NotFound/Join
 - app/mod.rs
   - 建 `reqwest Client`（直连优先/代理回退/池 256，见上）
   - 调 `utils::scan_local_files` 全量扫本地一次（同遍清 `.tmp`）

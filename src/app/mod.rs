@@ -31,8 +31,8 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
 
     let concurrency = cfg.concurrency;
     let end = cfg.resolved_end(chrono::Utc::now().date_naive());
-    let start_default = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("valid default date");
-    let start_cfg = cfg.start.unwrap_or(start_default);
+    let start_fallback = chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("valid default date");
+    let start_cfg = cfg.start.or(cfg.start_default).unwrap_or(start_fallback);
 
     tracing::info!(
         symbols = cfg.symbol.len(),

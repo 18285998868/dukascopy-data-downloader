@@ -126,10 +126,11 @@ where
         });
     }
     if stats.total > 0 && stats.ok == 0 && stats.not_found == stats.total {
-        return Err(AppError::DownloadFailed {
-            url: "batch".into(),
-            reason: format!("all {}/{} not found", stats.not_found, stats.total),
-        });
+        tracing::warn!(
+            not_found = stats.not_found,
+            total = stats.total,
+            "all requested files not found; continuing",
+        );
     }
     Ok(stats)
 }
@@ -200,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_downloads_all_not_found_returns_err() {
+    async fn run_downloads_all_not_found_returns_ok() {
         let client = reqwest::Client::new();
         let tasks = vec![dummy_task("a"), dummy_task("b")];
         let download_fn = |_: reqwest::Client, _: DownloadTask| async move {
@@ -208,10 +209,11 @@ mod tests {
                 url: "http://x".into(),
             })
         };
-        let err = run_downloads_inner(&client, tasks, 16, download_fn)
+        let stats = run_downloads_inner(&client, tasks, 16, download_fn)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("all 2/2 not found"));
+            .unwrap();
+        assert_eq!(stats.not_found, 2);
+        assert_eq!(stats.ok, 0);
     }
 
     #[tokio::test]

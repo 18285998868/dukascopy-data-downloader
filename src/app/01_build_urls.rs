@@ -129,7 +129,10 @@ pub fn build_urls(
         .into_iter()
         .map(|date| {
             let url = build_url(symbol, price_type, tf, date, period);
-            let suffix = url.strip_prefix(&format!("{FEED_BASE}/")).unwrap_or(&url);
+            let suffix = url
+                .strip_prefix(FEED_BASE)
+                .and_then(|s| s.strip_prefix('/'))
+                .unwrap_or(&url);
             let rel_path = format!("{LOCAL_PREFIX}/{suffix}");
             DownloadUrl {
                 url,
