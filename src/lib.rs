@@ -15,16 +15,10 @@
 //! ddd::app::run(std::path::Path::new("config.toml")).await
 //! # }
 //! ```
-
-#![deny(clippy::correctness)]
-#![warn(
-    clippy::suspicious,
-    clippy::style,
-    clippy::complexity,
-    clippy::perf,
-    missing_docs,
-    missing_debug_implementations
-)]
+//!
+//! The lint policy (`missing_docs`, `clippy::correctness`, …) is declared in
+//! `Cargo.toml` under `[workspace.lints]` so that it applies to the library,
+//! the binary and the integration tests alike.
 
 pub mod app;
 

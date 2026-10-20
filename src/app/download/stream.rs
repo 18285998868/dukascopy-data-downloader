@@ -9,12 +9,11 @@
 use std::time::Duration;
 
 use backoff::Error as BackoffError;
-use backoff::backoff::Backoff;
 use backoff::future::retry;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::DownloadTask;
-use crate::utils::backoff::default_backoff;
+use crate::utils::backoff::{BoundedBackoff, default_backoff};
 
 /// Download a bi5 file with retry, streaming directly to disk.
 ///
@@ -24,6 +23,25 @@ use crate::utils::backoff::default_backoff;
 ///
 /// Returns [`crate::AppError::NotFound`] on HTTP 404 (not retried), and any
 /// other [`crate::AppError`] once the backoff policy is exhausted.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::path::PathBuf;
+/// # use ddd::config::{DownloadTask, Symbol, Timeframe};
+/// # async fn example() -> Result<(), ddd::AppError> {
+/// let client = reqwest::Client::new();
+/// let task = DownloadTask {
+///     url: "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/BID_candles_day_1.bi5"
+///         .to_string(),
+///     dest: PathBuf::from("/tmp/dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),
+///     symbol: Symbol::new("EURUSD")?,
+///     timeframe: Timeframe::D1,
+/// };
+///
+/// ddd::app::download::stream::download_to_file(&client, &task).await
+/// # }
+/// ```
 pub async fn download_to_file(
     client: &reqwest::Client,
     task: &DownloadTask,
@@ -31,36 +49,57 @@ pub async fn download_to_file(
     download_to_file_with_backoff(client, task, default_backoff()).await
 }
 
-/// Classify an HTTP response: `None` means success, otherwise a retry decision.
+/// The verdict on one HTTP response.
+struct StatusVerdict {
+    /// The underlying error.
+    error: crate::AppError,
+    /// Whether repeating the attempt can plausibly succeed.
+    transient: bool,
+    /// How long the server asked us to wait before trying again.
+    wait_hint: Option<Duration>,
+}
+
+/// Classify an HTTP response: `None` means success.
 ///
-/// `retry_after` is the server-supplied wait hint (from `Retry-After`), honoured
-/// on transient responses so a rate limiter is not hammered.
+/// `retry_after` is the server-supplied wait hint (from `Retry-After`).
+/// It is reported separately from the error because it must be spent by the
+/// *operation*, not handed to the retry driver: see
+/// [`download_to_file_with_backoff`] for why.
 fn classify_status(
     status: reqwest::StatusCode,
     retry_after: Option<Duration>,
     url: &str,
-) -> Option<BackoffError<crate::AppError>> {
+) -> Option<StatusVerdict> {
     if status.is_success() {
         return None;
     }
     let reason = format!("HTTP {status}");
     if status == reqwest::StatusCode::NOT_FOUND {
-        Some(BackoffError::Permanent(crate::AppError::NotFound {
-            url: url.to_string(),
-        }))
+        Some(StatusVerdict {
+            error: crate::AppError::NotFound {
+                url: url.to_string(),
+            },
+            transient: false,
+            wait_hint: None,
+        })
     } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        Some(BackoffError::Transient {
-            err: crate::AppError::DownloadFailed {
+        Some(StatusVerdict {
+            error: crate::AppError::DownloadFailed {
                 url: url.to_string(),
                 reason,
             },
-            retry_after,
+            transient: true,
+            wait_hint: retry_after,
         })
     } else {
-        Some(BackoffError::Permanent(crate::AppError::DownloadFailed {
-            url: url.to_string(),
-            reason,
-        }))
+        Some(StatusVerdict {
+            error: crate::AppError::DownloadFailed {
+                url: url.to_string(),
+                reason,
+            },
+            transient: false,
+            wait_hint: None,
+        })
     }
 }
 
@@ -78,15 +117,27 @@ fn tmp_path_for(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_extension("bi5.tmp")
 }
 
+/// Attach the path an I/O error happened on.
+fn io_error(path: &std::path::Path, source: std::io::Error) -> crate::AppError {
+    crate::AppError::FileIo {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 async fn download_to_file_with_backoff(
     client: &reqwest::Client,
     task: &DownloadTask,
-    backoff: impl Backoff + 'static,
+    backoff: BoundedBackoff,
 ) -> Result<(), crate::AppError> {
+    // The budget is shared: the operation clamps a server wait hint against
+    // it, the policy stops when it is gone.
+    let budget = backoff.budget();
     let op = || {
         let c = client.clone();
         let u = task.url.clone();
         let dest = task.dest.clone();
+        let budget = budget.clone();
         async move {
             let mut resp = match c.get(&u).send().await {
                 Ok(r) => r,
@@ -97,7 +148,7 @@ async fn download_to_file_with_backoff(
                     });
                 }
             };
-            if let Some(err) = classify_status(
+            if let Some(verdict) = classify_status(
                 resp.status(),
                 resp.headers()
                     .get(reqwest::header::RETRY_AFTER)
@@ -105,13 +156,32 @@ async fn download_to_file_with_backoff(
                     .and_then(parse_retry_after),
                 &u,
             ) {
-                return Err(err);
+                if !verdict.transient {
+                    return Err(BackoffError::Permanent(verdict.error));
+                }
+                // The wait hint is spent here and *not* handed to
+                // `backoff::future::retry`: that crate prefers the hint over
+                // the policy's own interval, which means the policy — and
+                // with it the only budget check — is never consulted. A
+                // server answering every retry with `Retry-After` would
+                // then keep this file retrying forever. Waiting here charges
+                // the hint to the budget and keeps the policy in charge.
+                if let Some(hint) = verdict.wait_hint {
+                    let wait = hint.min(budget.remaining());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                return Err(BackoffError::Transient {
+                    err: verdict.error,
+                    retry_after: None,
+                });
             }
 
             if let Some(p) = dest.parent() {
                 tokio::fs::create_dir_all(p)
                     .await
-                    .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+                    .map_err(|e| BackoffError::Permanent(io_error(p, e)))?;
             }
 
             // Drop any scratch file left by an interrupted run before writing,
@@ -120,11 +190,11 @@ async fn download_to_file_with_backoff(
             match tokio::fs::remove_file(&tmp_path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(BackoffError::Permanent(crate::AppError::Io(e))),
+                Err(e) => return Err(BackoffError::Permanent(io_error(&tmp_path, e))),
             }
             let mut file = tokio::fs::File::create(&tmp_path)
                 .await
-                .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+                .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
 
             while let Some(chunk) = resp.chunk().await.map_err(|e| BackoffError::Transient {
                 err: crate::AppError::from(e),
@@ -132,7 +202,7 @@ async fn download_to_file_with_backoff(
             })? {
                 file.write_all(&chunk)
                     .await
-                    .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+                    .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
             }
 
             // `flush` only hands the bytes to the kernel. Without `sync_all` a
@@ -140,15 +210,25 @@ async fn download_to_file_with_backoff(
             // cache scan treats as complete forever.
             file.flush()
                 .await
-                .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+                .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
             file.sync_all()
                 .await
-                .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+                .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
             drop(file);
 
             tokio::fs::rename(&tmp_path, &dest)
                 .await
-                .map_err(|e| BackoffError::Permanent(crate::AppError::Io(e)))?;
+                .map_err(|e| BackoffError::Permanent(io_error(&dest, e)))?;
+
+            // `sync_all` on the file made its *contents* durable, but the
+            // directory entry created by the rename is still in the page
+            // cache. Without this fsync a power loss can undo the rename
+            // itself, leaving the payload behind under its scratch name.
+            if let Some(parent) = dest.parent() {
+                if let Ok(dir) = tokio::fs::File::open(parent).await {
+                    let _ = dir.sync_all().await;
+                }
+            }
 
             Ok(())
         }
@@ -162,6 +242,7 @@ mod tests {
     use super::*;
     use crate::AppError;
     use crate::config::{Symbol, Timeframe};
+    use crate::utils::backoff::RetryBudget;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -170,25 +251,18 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Backoff that never retries (max_elapsed = 0).
-    fn no_retry() -> backoff::ExponentialBackoff {
-        backoff::ExponentialBackoff {
-            current_interval: Duration::ZERO,
-            initial_interval: Duration::ZERO,
-            max_elapsed_time: Some(Duration::ZERO),
-            ..Default::default()
-        }
+    /// Backoff whose budget is already exhausted: it never retries.
+    fn no_retry() -> BoundedBackoff {
+        BoundedBackoff::new(Arc::new(RetryBudget::new(Duration::ZERO)))
     }
 
     /// Backoff that retries for a bounded window with tiny intervals.
-    fn fast_retry(max_elapsed: Duration) -> backoff::ExponentialBackoff {
-        backoff::ExponentialBackoff {
-            current_interval: Duration::ZERO,
-            initial_interval: Duration::from_millis(1),
-            multiplier: 1.0,
-            max_elapsed_time: Some(max_elapsed),
-            ..Default::default()
-        }
+    fn fast_retry(max_elapsed: Duration) -> BoundedBackoff {
+        BoundedBackoff::with_base(
+            Arc::new(RetryBudget::new(max_elapsed)),
+            Duration::from_millis(1),
+            1.0,
+        )
     }
 
     const URL_PATH: &str = "/datafeed/EURUSD/2025/BID_candles_day_1.bi5";
@@ -227,11 +301,11 @@ mod tests {
 
     #[test]
     fn classify_404_is_permanent_not_found() {
-        let err = classify_status(reqwest::StatusCode::NOT_FOUND, None, "http://x/a.bi5").unwrap();
-        match err {
-            BackoffError::Permanent(AppError::NotFound { url }) => {
-                assert_eq!(url, "http://x/a.bi5")
-            }
+        let verdict =
+            classify_status(reqwest::StatusCode::NOT_FOUND, None, "http://x/a.bi5").unwrap();
+        assert!(!verdict.transient);
+        match verdict.error {
+            crate::AppError::NotFound { url } => assert_eq!(url, "http://x/a.bi5"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -240,41 +314,39 @@ mod tests {
     fn classify_5xx_and_429_are_transient() {
         for code in [429u16, 500, 502, 503, 504] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
-            match classify_status(status, None, "u").expect("should be an error") {
-                BackoffError::Transient { err, .. } => {
-                    assert!(matches!(err, AppError::DownloadFailed { .. }));
-                }
-                BackoffError::Permanent(err) => panic!("{code} should be transient, got {err:?}"),
-            }
+            let verdict = classify_status(status, None, "u").expect("should be an error");
+            assert!(verdict.transient, "{code} should be transient");
+            assert!(matches!(
+                verdict.error,
+                crate::AppError::DownloadFailed { .. }
+            ));
         }
     }
 
-    /// A 429 must carry the server's wait hint through to the backoff policy.
+    /// A 429 must carry the server's wait hint through to the retry policy.
     #[test]
     fn classify_429_forwards_retry_after() {
-        let err = classify_status(
+        let verdict = classify_status(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             Some(Duration::from_secs(7)),
             "u",
         )
         .unwrap();
-        match err {
-            BackoffError::Transient { retry_after, .. } => {
-                assert_eq!(retry_after, Some(Duration::from_secs(7)));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(verdict.transient);
+        assert_eq!(verdict.wait_hint, Some(Duration::from_secs(7)));
     }
 
     #[test]
     fn classify_other_4xx_is_permanent() {
         for code in [400u16, 401, 403, 410, 451] {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
-            match classify_status(status, None, "u").expect("should be an error") {
-                BackoffError::Permanent(AppError::DownloadFailed { reason, .. }) => {
+            let verdict = classify_status(status, None, "u").expect("should be an error");
+            assert!(!verdict.transient, "{code} should be permanent");
+            match verdict.error {
+                crate::AppError::DownloadFailed { reason, .. } => {
                     assert!(reason.starts_with("HTTP "), "{reason}");
                 }
-                other => panic!("{code} should be permanent, got {other:?}"),
+                other => panic!("{code} should be a download failure, got {other:?}"),
             }
         }
     }
@@ -474,5 +546,159 @@ mod tests {
             1,
             "404 must be attempted exactly once"
         );
+    }
+
+    // — retry budget —
+
+    /// A server that answers every retry with `Retry-After` must not be able
+    /// to keep a file retrying forever.
+    ///
+    /// `backoff::future::retry` prefers the hint over the policy's own
+    /// interval, which means the policy — and with it the only budget check —
+    /// would never be consulted. The hint is therefore spent by the operation
+    /// itself and charged to the budget.
+    #[tokio::test]
+    async fn a_retry_after_hint_cannot_outlive_the_budget() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        Mock::given(method("GET"))
+            .and(path(URL_PATH))
+            .respond_with(move |_: &Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(429).insert_header("Retry-After", "60")
+            })
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("BID_candles_day_1.bi5");
+
+        let started = std::time::Instant::now();
+        let err = download_to_file_with_backoff(
+            &client(),
+            &task(&server, &dest),
+            BoundedBackoff::new(Arc::new(RetryBudget::new(Duration::from_millis(200)))),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::DownloadFailed { .. }), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a 60s hint must be clamped to the remaining budget"
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) <= 2,
+            "the budget must stop the retry loop, got {} attempts",
+            hits.load(Ordering::SeqCst)
+        );
+        assert!(!dest.exists());
+    }
+
+    /// The hint must still be honoured: a rate limiter that says "wait one
+    /// second" is not hammered.
+    #[tokio::test]
+    async fn a_retry_after_hint_is_actually_waited_out() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        Mock::given(method("GET"))
+            .and(path(URL_PATH))
+            .respond_with(move |_: &Request| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(429).insert_header("Retry-After", "1")
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"ok")
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("BID_candles_day_1.bi5");
+
+        let started = std::time::Instant::now();
+        download_to_file_with_backoff(
+            &client(),
+            &task(&server, &dest),
+            fast_retry(Duration::from_secs(10)),
+        )
+        .await
+        .expect("retry should recover from the 429");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the one-second hint was not honoured"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ok");
+    }
+
+    /// The budget bounds the whole attempt sequence, not just the intervals.
+    #[tokio::test]
+    async fn the_budget_bounds_a_failing_file() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        Mock::given(method("GET"))
+            .and(path(URL_PATH))
+            .respond_with(move |_: &Request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            })
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("BID_candles_day_1.bi5");
+
+        let started = std::time::Instant::now();
+        let err = download_to_file_with_backoff(
+            &client(),
+            &task(&server, &dest),
+            BoundedBackoff::with_base(
+                Arc::new(RetryBudget::new(Duration::from_millis(200))),
+                Duration::from_millis(10),
+                1.0,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::DownloadFailed { .. }), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget must stop the retry loop"
+        );
+        assert!(hits.load(Ordering::SeqCst) >= 1);
+        assert!(!dest.exists());
+    }
+
+    /// An I/O failure must name the path it happened on: a batch summary
+    /// collects up to 20 of them and bare I/O errors are indistinguishable.
+    #[tokio::test]
+    async fn an_io_failure_names_the_path() {
+        let server = server_returning(ResponseTemplate::new(200).set_body_bytes(b"x")).await;
+        let dir = TempDir::new().unwrap();
+        // A plain file where a directory is expected: `create_dir_all` cannot
+        // succeed below it.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let dest = blocker.join("nested/BID_candles_day_1.bi5");
+
+        let err = download_to_file_with_backoff(&client(), &task(&server, &dest), no_retry())
+            .await
+            .unwrap_err();
+
+        match err {
+            AppError::FileIo { path, .. } => {
+                assert!(
+                    path.to_string_lossy().contains("nested"),
+                    "the failing path must be reported: {path:?}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

@@ -263,6 +263,20 @@ impl AppConfig {
     /// Resolve the download end date: `min(config.end, yesterday)`.
     ///
     /// Computed once by the caller; downstream only consumes the value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ddd::config::AppConfig;
+    /// let cfg = AppConfig::default();
+    /// let today = chrono::NaiveDate::from_ymd_opt(2025, 3, 2).unwrap();
+    ///
+    /// // Without an explicit `end`, the range stops at yesterday.
+    /// assert_eq!(
+    ///     cfg.resolved_end(today),
+    ///     chrono::NaiveDate::from_ymd_opt(2025, 3, 1).unwrap()
+    /// );
+    /// ```
     #[must_use]
     pub fn resolved_end(&self, today: chrono::NaiveDate) -> chrono::NaiveDate {
         let yesterday = today.pred_opt().unwrap_or(today);
@@ -298,7 +312,9 @@ impl AppConfig {
     ) -> Result<(chrono::NaiveDate, chrono::NaiveDate), AppError> {
         let start = self.start.unwrap_or(DEFAULT_START);
         let end = self.resolved_end(today);
-        let days = (end - start).num_days();
+        // `start..=end` is inclusive, so the range covers one more calendar
+        // day than the distance between the two dates.
+        let days = (end - start).num_days() + 1;
         if days > MAX_RANGE_DAYS {
             return Err(AppError::Config(format!(
                 "date range {start}..={end} spans {days} days, exceeding maximum {MAX_RANGE_DAYS}"
@@ -694,5 +710,40 @@ mod tests {
             start > end,
             "reversed range must survive for run_one to skip"
         );
+    }
+
+    /// The cap counts the *calendar days in the inclusive range*: an
+    /// off-by-one must not let one extra day through.
+    #[test]
+    fn effective_range_counts_the_inclusive_range() {
+        let start = date(2020, 1, 1);
+        let end = start + chrono::Duration::days(MAX_RANGE_DAYS);
+        let cfg = load(&format!(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"{start}\"\nend = \"{end}\""
+        ))
+        .expect("load itself succeeds");
+
+        // `start..=end` covers MAX_RANGE_DAYS + 1 calendar days.
+        let err = cfg
+            .effective_range(end + chrono::Duration::days(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeding maximum"), "{err}");
+    }
+
+    #[test]
+    fn effective_range_accepts_exactly_the_cap() {
+        let start = date(2020, 1, 1);
+        let end = start + chrono::Duration::days(MAX_RANGE_DAYS - 1);
+        let cfg = load(&format!(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"{start}\"\nend = \"{end}\""
+        ))
+        .expect("load itself succeeds");
+
+        // `start..=end` covers exactly MAX_RANGE_DAYS calendar days.
+        let (s, e) = cfg
+            .effective_range(end + chrono::Duration::days(1))
+            .unwrap();
+        assert_eq!(s, start);
+        assert_eq!(e, end);
     }
 }

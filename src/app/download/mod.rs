@@ -10,34 +10,233 @@ pub mod stream;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use crate::AppError;
-use crate::config::DownloadTask;
+use crate::config::{DownloadTask, Timeframe};
 use futures::StreamExt;
 
 /// How often a line of progress is logged, in completed files.
 const PROGRESS_EVERY: usize = 100;
 /// Maximum number of individual failure details retained in the batch summary.
 const MAX_REPORTED_FAILURES: usize = 20;
-/// Consecutive failures after which a pair is abandoned for this run.
+/// Fraction of "not found" answers above which the batch is warned about.
 ///
-/// An unreachable symbol would otherwise burn the full retry budget on every
-/// single file. Tripping this stops the waste and lets the remaining pairs
-/// finish. A success — or a 404, which is normal on market holidays — resets
-/// the streak.
-pub const MAX_CONSECUTIVE_FAILURES: usize = 5;
+/// Dukascopy publishes a file for every calendar day — weekends and
+/// holidays included — so a missing file is not a normal holiday. A
+/// noticeable share of 404s means the requested range reaches beyond the
+/// feed's coverage.
+const NOT_FOUND_WARN_RATIO: f64 = 0.05;
+/// Fraction of "not found" answers above which the batch fails.
+///
+/// Past this point the run almost certainly downloaded nothing useful, and
+/// reporting success would be actively misleading.
+const NOT_FOUND_FAIL_RATIO: f64 = 0.50;
+/// Smallest batch for which the 404 ratio is meaningful.
+///
+/// With only a handful of files the ratio is dominated by a single missing
+/// day; such a batch is warned about but never failed.
+const MIN_SAMPLES_FOR_NOT_FOUND_RATIO: usize = 8;
+/// Number of consecutively missing buckets that means the requested range
+/// is outside the feed's coverage.
+///
+/// A weekend plus a public holiday is three days in a row, so the threshold
+/// sits above that. The rule is independent of the overall ratio: a long
+/// gap points at the feed's coverage even when the batch as a whole looks
+/// mostly healthy.
+const MISSING_RUN_FAIL_LEN: usize = 5;
+/// Number of recent attempts the breaker keeps in its sliding window.
+///
+/// Must stay above [`MAX_REPORTED_FAILURES`]: the breaker caps how many files
+/// a pair may fail on, and a cap below the reason limit would make the
+/// limit unreachable.
+const BREAKER_WINDOW: usize = 32;
+/// Failure ratio inside the window that opens the breaker.
+const BREAKER_FAIL_RATIO: f64 = 0.5;
 
 /// Outcome of one task inside a batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum TaskOutcome {
-    /// Attempted and accounted for.
-    Done,
+    /// Downloaded successfully.
+    Ok,
+    /// The server does not have this file (HTTP 404), with the bucket it was
+    /// missing for.
+    NotFound {
+        /// Key of the bucket the file belongs to.
+        bucket: String,
+    },
+    /// Failed for any other reason.
+    Failed(AppError),
     /// Never attempted: the circuit breaker was already open.
     Skipped,
+}
+
+/// The bucket key of a task's destination.
+///
+/// The trailing *directory* components identify the bucket: the year for
+/// `D1`, year and month for `H1`, year, month and day for `M1`. They are
+/// fixed-width numbers, so the keys order chronologically as strings.
+fn bucket_key(task: &DownloadTask) -> String {
+    let depth = match task.timeframe {
+        Timeframe::D1 => 1,
+        Timeframe::H1 => 2,
+        Timeframe::M1 => 3,
+    };
+    let parts: Vec<String> = task
+        .dest
+        .parent()
+        .map(|dir| dir.components().rev().take(depth).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.join("/")
+}
+
+/// The calendar position of a bucket key, as `(year, month, day)`.
+///
+/// Components the timeframe does not have default to 1, so a year key
+/// becomes `(year, 1, 1)`.
+fn bucket_position(key: &str, timeframe: Timeframe) -> Option<(i32, u32, u32)> {
+    let mut parts = key.split('/');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let (month, day) = match timeframe {
+        Timeframe::D1 => (1, 1),
+        Timeframe::H1 => (parts.next()?.parse().ok()?, 1),
+        Timeframe::M1 => (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?),
+    };
+    Some((year, month, day))
+}
+
+/// Whether two buckets are adjacent on the calendar.
+fn is_adjacent_bucket(a: (i32, u32, u32), b: (i32, u32, u32), timeframe: Timeframe) -> bool {
+    match timeframe {
+        Timeframe::D1 => b == (a.0 + 1, 1, 1),
+        Timeframe::H1 => {
+            // December rolls over into the next year.
+            let next = if a.1 == 12 {
+                (a.0 + 1, 1)
+            } else {
+                (a.0, a.1 + 1)
+            };
+            b == (next.0, next.1, 1)
+        }
+        Timeframe::M1 => match (
+            chrono::NaiveDate::from_ymd_opt(a.0, a.1, a.2),
+            chrono::NaiveDate::from_ymd_opt(b.0, b.1, b.2),
+        ) {
+            (Some(da), Some(db)) => da.succ_opt() == Some(db),
+            _ => false,
+        },
+    }
+}
+
+/// The longest run of consecutively missing buckets.
+///
+/// The keys are sorted chronologically and every neighbouring pair is
+/// checked for calendar adjacency: the run only continues when no calendar
+/// slot in between was actually served.
+fn longest_missing_run(keys: &mut Vec<String>, timeframe: Timeframe) -> usize {
+    if keys.is_empty() {
+        return 0;
+    }
+    keys.sort();
+    keys.dedup();
+    let mut longest = 1;
+    let mut current = 1;
+    for pair in keys.windows(2) {
+        let adjacent = match (
+            bucket_position(&pair[0], timeframe),
+            bucket_position(&pair[1], timeframe),
+        ) {
+            (Some(a), Some(b)) => is_adjacent_bucket(a, b, timeframe),
+            _ => false,
+        };
+        if adjacent {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 1;
+        }
+    }
+    longest
+}
+
+/// A sliding-window circuit breaker for one pair.
+///
+/// It records the outcome of the last [`BREAKER_WINDOW`] attempts and opens
+/// once the failure ratio inside the window reaches [`BREAKER_FAIL_RATIO`].
+///
+/// A *consecutive* failure counter would be simpler, but it has a blind spot
+/// exactly where it is needed: any single success resets it, so a feed that
+/// fails half of its requests never trips it and the run keeps burning the
+/// retry budget on every single file. A window has no such blind spot.
+#[derive(Debug)]
+struct Breaker {
+    /// Outcome of the recent attempts: `true` means the attempt succeeded.
+    window: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    /// Latched "stop attempting" flag.
+    open: AtomicBool,
+}
+
+impl Breaker {
+    /// Create a closed breaker.
+    fn new() -> Self {
+        Self {
+            window: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                BREAKER_WINDOW,
+            )),
+            open: AtomicBool::new(false),
+        }
+    }
+
+    /// Record one attempt and report whether the breaker is now open.
+    ///
+    /// `succeeded` is true for a download that worked *and* for a 404: a file
+    /// the server does not have says nothing about the pair's reachability.
+    fn record(&self, succeeded: bool) -> bool {
+        let mut window = self
+            .window
+            .lock()
+            .expect("BUG: breaker mutex is not poisoned");
+        if window.len() == BREAKER_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(succeeded);
+        // The ratio only carries information once the window is full.
+        if window.len() < BREAKER_WINDOW {
+            return self.open.load(Ordering::Relaxed);
+        }
+        let failures = window.iter().filter(|&&ok| !ok).count();
+        if failures as f64 / window.len() as f64 >= BREAKER_FAIL_RATIO {
+            self.open.store(true, Ordering::Relaxed);
+        }
+        self.open.load(Ordering::Relaxed)
+    }
+
+    /// Open the breaker unconditionally.
+    fn trip(&self) {
+        self.open.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the breaker is open, i.e. further attempts must be skipped.
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether the error means the endpoint could not be reached at all.
+///
+/// A transport failure (DNS, connect, timeout) applies to every file of the
+/// pair and is proof that the pair is unreachable. An HTTP status failure is
+/// about one answer, may well be transient, and says nothing about the rest
+/// of the range.
+fn is_transport_failure(err: &AppError) -> bool {
+    matches!(err, AppError::Http(_))
 }
 
 /// Aggregate statistics for a completed batch of downloads.
@@ -74,6 +273,23 @@ impl DownloadStats {
 /// Returns [`AppError::BatchFailed`] carrying a bounded sample of per-file
 /// causes when any task fails; a task answered with 404 is counted in
 /// [`DownloadStats::not_found`] and does **not** fail the batch.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use tokio::sync::Semaphore;
+/// # async fn example() -> Result<(), ddd::AppError> {
+/// let client = reqwest::Client::new();
+/// let gate = Arc::new(Semaphore::new(4));
+///
+/// // An empty task list is a no-op that still yields usable statistics.
+/// let stats = ddd::app::download::run_downloads(&client, Vec::new(), 4, &gate).await?;
+/// assert_eq!(stats.total, 0);
+/// assert_eq!(stats.ok, 0);
+/// # Ok(())
+/// # }
+/// ```
 pub async fn run_downloads(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
@@ -88,12 +304,16 @@ pub async fn run_downloads(
 
 /// Core download orchestration, parameterized by the download function for testing.
 ///
-/// Streams tasks through `buffer_unordered(concurrency)`; each task additionally
-/// holds a permit from the shared `gate`, so the effective ceiling is
-/// `min(concurrency, gate permits)` no matter how many pairs run at once.
+/// The first file is downloaded **on its own** before the rest are released.
+/// An unreachable pair would otherwise spend a full wave of `concurrency`
+/// requests — each burning the whole retry budget — to reach the verdict a
+/// single request already gives. The remaining files then stream through
+/// `buffer_unordered(concurrency)`, each additionally holding a permit from
+/// the shared `gate`.
 ///
-/// The closure reports [`TaskOutcome::Skipped`] instead of an error when the
-/// circuit breaker is open, so skipped files never inflate `failed`.
+/// The breaker closes the batch when the recent attempts look unhealthy: its
+/// window opens on a failure ratio, and a transport failure on the probe
+/// trips it outright.
 async fn run_downloads_inner<F, Fut>(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
@@ -110,60 +330,77 @@ where
     if total == 0 {
         return Ok(DownloadStats::default());
     }
+    // `total > 0` is checked above, so there is a first task.
+    let timeframe = tasks.first().expect("total > 0").timeframe;
     tracing::debug!(total, concurrency, "downloading files");
 
     let mut stats = DownloadStats {
         total,
         ..DownloadStats::default()
     };
-    let mut reasons: Vec<String> = Vec::new();
-    let streak = Arc::new(AtomicUsize::new(0));
+    let mut reasons: Vec<String> = Vec::with_capacity(MAX_REPORTED_FAILURES);
+    let mut missing_buckets: Vec<String> = Vec::new();
+    let breaker = Breaker::new();
 
-    // The per-task async block is constructed once per element, so `download_fn`
-    // is captured by reference; capturing it by value would move it out of the
-    // `FnMut` `map` closure on the first element.
+    let mut tasks = tasks.into_iter();
+
+    // — probe —
+    let probe = tasks.next().expect("total > 0");
+    match run_one_task(client, gate, &breaker, &download_fn, probe).await {
+        TaskOutcome::Ok => stats.ok += 1,
+        TaskOutcome::NotFound { bucket } => {
+            stats.not_found += 1;
+            missing_buckets.push(bucket);
+        }
+        TaskOutcome::Failed(err) => {
+            stats.failed += 1;
+            if reasons.len() < MAX_REPORTED_FAILURES {
+                reasons.push(err.chain());
+            }
+            if is_transport_failure(&err) {
+                // The endpoint could not be reached at all. Every remaining
+                // file of this pair would spend the whole retry budget to
+                // reach the same verdict, so stop here.
+                breaker.trip();
+                tracing::warn!(
+                    failed = stats.failed,
+                    total = stats.total,
+                    "probe could not reach the endpoint; remaining files were not attempted",
+                );
+            }
+        }
+        TaskOutcome::Skipped => unreachable!("the breaker is closed before the probe runs"),
+    }
+
+    // — release the rest —
+    // The per-task async block is constructed once per element, so
+    // `download_fn` is captured by reference; capturing it by value would
+    // move it out of the `FnMut` `map` closure on the first element.
     let download_fn = &download_fn;
     let mut stream = futures::stream::iter(tasks)
         .map(|t| {
             let c = client.clone();
             let gate = gate.clone();
-            let streak = streak.clone();
-            let span = tracing::info_span!("download", symbol = %t.symbol, tf = %t.timeframe);
-            async move {
-                if streak.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_FAILURES {
-                    return Ok(TaskOutcome::Skipped);
-                }
-                // The gate is never closed, so acquiring can only fail on a bug.
-                let _permit = gate.acquire().await.expect("download gate is never closed");
-                let result = download_fn(c, t).await;
-                match &result {
-                    // A success or an expected 404 clears the failure streak.
-                    Ok(()) | Err(AppError::NotFound { .. }) => {
-                        streak.store(0, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        streak.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                result.map(|()| TaskOutcome::Done)
-            }
-            .instrument(span)
+            let breaker = &breaker;
+            async move { run_one_task(&c, &gate, breaker, download_fn, t).await }
         })
         .buffer_unordered(concurrency);
-
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(TaskOutcome::Done) => stats.ok += 1,
-            Ok(TaskOutcome::Skipped) => stats.skipped += 1,
-            Err(AppError::NotFound { .. }) => stats.not_found += 1,
-            Err(e) => {
+    while let Some(outcome) = stream.next().await {
+        match outcome {
+            TaskOutcome::Ok => stats.ok += 1,
+            TaskOutcome::NotFound { bucket } => {
+                stats.not_found += 1;
+                missing_buckets.push(bucket);
+            }
+            TaskOutcome::Failed(err) => {
                 stats.failed += 1;
                 if reasons.len() < MAX_REPORTED_FAILURES {
-                    reasons.push(e.chain());
+                    reasons.push(err.chain());
                 } else {
-                    tracing::debug!(error = %e, "download failed (detail not retained)");
+                    tracing::debug!(error = %err.chain(), "download failed (detail not retained)");
                 }
             }
+            TaskOutcome::Skipped => stats.skipped += 1,
         }
 
         if stats.done() % PROGRESS_EVERY == 0 {
@@ -183,14 +420,15 @@ where
         tracing::debug!(
             not_found = stats.not_found,
             total = stats.total,
-            "files not found on server (404, expected for edge dates)",
+            "files not found on server (404)",
         );
     }
     if stats.circuit_open() {
         tracing::warn!(
             skipped = stats.skipped,
             failed = stats.failed,
-            max_consecutive = MAX_CONSECUTIVE_FAILURES,
+            window = BREAKER_WINDOW,
+            fail_ratio = BREAKER_FAIL_RATIO,
             "circuit breaker opened; remaining files for this pair were not attempted",
         );
     }
@@ -209,14 +447,97 @@ where
             reasons,
         });
     }
+
+    // A 404 is not a holiday: the feed publishes a file for every calendar
+    // day, weekends and holidays included. A noticeable share of them means
+    // the requested range reaches beyond what the feed has published — and
+    // reporting success would be actively misleading, because the run
+    // downloaded nothing while exiting with a success status.
+    let longest_run = longest_missing_run(&mut missing_buckets, timeframe);
+    if stats.total >= MIN_SAMPLES_FOR_NOT_FOUND_RATIO {
+        let ratio = stats.not_found as f64 / stats.total as f64;
+        if ratio > NOT_FOUND_FAIL_RATIO {
+            return Err(AppError::RangeUnavailable {
+                not_found: stats.not_found,
+                total: stats.total,
+                longest_run,
+            });
+        }
+        if ratio > NOT_FOUND_WARN_RATIO {
+            tracing::warn!(
+                not_found = stats.not_found,
+                total = stats.total,
+                ratio = %ratio,
+                "a noticeable share of the requested range is missing from the data feed",
+            );
+        }
+    }
+    // A long stretch of consecutive missing buckets points at the same
+    // problem even when the overall ratio is modest: the feed does not have
+    // that stretch of the range at all.
+    if longest_run >= MISSING_RUN_FAIL_LEN {
+        return Err(AppError::RangeUnavailable {
+            not_found: stats.not_found,
+            total: stats.total,
+            longest_run,
+        });
+    }
     if stats.ok == 0 && stats.not_found == stats.total {
         tracing::warn!(
             not_found = stats.not_found,
             total = stats.total,
-            "all requested files not found; continuing",
+            "all requested files not found; the range is probably outside the feed's coverage",
         );
     }
     Ok(stats)
+}
+
+/// Run one download task, update the breaker, and classify the outcome.
+///
+/// A task that the breaker has already given up on is reported as
+/// [`TaskOutcome::Skipped`] rather than as an error, so skipped files never
+/// inflate the failure count.
+async fn run_one_task<F, Fut>(
+    client: &reqwest::Client,
+    gate: &Arc<Semaphore>,
+    breaker: &Breaker,
+    download_fn: &F,
+    task: DownloadTask,
+) -> TaskOutcome
+where
+    F: Fn(reqwest::Client, DownloadTask) -> Fut,
+    Fut: Future<Output = Result<(), AppError>>,
+{
+    let span = tracing::info_span!("download", symbol = %task.symbol, tf = %task.timeframe);
+    async {
+        if breaker.is_open() {
+            return TaskOutcome::Skipped;
+        }
+        let bucket = bucket_key(&task);
+        // The gate is never closed, so acquiring can only fail on a bug.
+        let _permit = gate
+            .acquire()
+            .await
+            .expect("BUG: download gate is never closed");
+        match download_fn(client.clone(), task).await {
+            Ok(()) => {
+                breaker.record(true);
+                TaskOutcome::Ok
+            }
+            Err(AppError::NotFound { .. }) => {
+                // A file the server does not have says nothing about whether
+                // the pair is reachable, so it must not count as a failure.
+                breaker.record(true);
+                TaskOutcome::NotFound { bucket }
+            }
+            Err(err) => {
+                breaker.record(false);
+                TaskOutcome::Failed(err)
+            }
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]
@@ -235,6 +556,40 @@ mod tests {
         }
     }
 
+    /// A task with an explicit timeframe and destination path.
+    fn task_for(timeframe: Timeframe, dest: &str, tag: &str) -> DownloadTask {
+        DownloadTask {
+            url: format!("http://example.com/EURUSD/{tag}"),
+            dest: std::path::PathBuf::from(dest),
+            symbol: Symbol::new("EURUSD").unwrap(),
+            timeframe,
+        }
+    }
+
+    /// `n` M1 tasks on consecutive days, starting 2025-01-01.
+    ///
+    /// Real calendar days matter here: the gap detection compares buckets by
+    /// date, so an impossible day number would break the chain.
+    fn daily_tasks(n: usize) -> Vec<DownloadTask> {
+        use chrono::Datelike;
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        (0..n)
+            .map(|i| {
+                let day = start + chrono::Duration::days(i as i64);
+                task_for(
+                    Timeframe::M1,
+                    &format!(
+                        "/tmp/dukascopy/EURUSD/{}/{:02}/{:02}/BID_candles_min_1.bi5",
+                        day.year(),
+                        day.month(),
+                        day.day()
+                    ),
+                    &i.to_string(),
+                )
+            })
+            .collect()
+    }
+
     fn tasks(n: usize) -> Vec<DownloadTask> {
         (0..n)
             .map(|i| task_named("EURUSD", &i.to_string()))
@@ -243,6 +598,20 @@ mod tests {
 
     fn client() -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    /// A genuine transport error.
+    ///
+    /// `reqwest::Error` cannot be constructed by hand, so the error is
+    /// produced by actually connecting to a closed port — the refusal comes
+    /// back immediately.
+    async fn transport_error() -> AppError {
+        reqwest::Client::new()
+            .get("http://127.0.0.1:1/never")
+            .send()
+            .await
+            .expect_err("connecting to a closed port must fail")
+            .into()
     }
 
     fn gate(n: usize) -> Arc<Semaphore> {
@@ -442,18 +811,16 @@ mod tests {
     #[tokio::test]
     async fn retained_reasons_are_capped_but_counts_stay_exact() {
         let n = MAX_REPORTED_FAILURES * 3;
-        // Alternating fail/succeed keeps the circuit breaker shut, so this
-        // isolates the reason cap from the breaker.
+        // All-fail keeps the trip point predictable: the window fills with
+        // failures, so the retained sample is bounded while the counts stay
+        // exact.
         let err = batch_failed(
             run_downloads_inner(
                 &client(),
                 tasks(n),
                 1,
                 &gate(1),
-                |_: reqwest::Client, t: DownloadTask| async move {
-                    let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
-                    if i % 2 == 0 { Err(boom()) } else { Ok(()) }
-                },
+                |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
             )
             .await
             .unwrap_err(),
@@ -467,8 +834,8 @@ mod tests {
                 reasons,
             } => {
                 assert_eq!(total, n);
-                assert_eq!(failed, n / 2);
-                assert_eq!(skipped, 0, "the breaker must stay shut here");
+                assert_eq!(failed, BREAKER_WINDOW);
+                assert_eq!(skipped, n - BREAKER_WINDOW);
                 assert_eq!(
                     reasons.len(),
                     MAX_REPORTED_FAILURES,
@@ -481,16 +848,65 @@ mod tests {
 
     // — circuit breaker —
 
+    /// A transport failure on the probe proves the pair is unreachable: the
+    /// remaining files must not be attempted at all.
+    ///
+    /// This is what the probe is for — without it, a full wave of
+    /// `concurrency` requests would each burn the whole retry budget to
+    /// reach the verdict a single request already gives.
     #[tokio::test]
-    async fn breaker_opens_after_consecutive_failures_and_skips_the_rest() {
+    async fn a_transport_failure_on_the_probe_skips_the_rest() {
         let attempts = Arc::new(Counter::new(0));
         let counter = attempts.clone();
-
         let err = batch_failed(
             run_downloads_inner(
                 &client(),
-                tasks(20),
-                1, // serial, so failures really are consecutive
+                tasks(100),
+                30,
+                &gate(30),
+                move |_: reqwest::Client, _: DownloadTask| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Err(transport_error().await)
+                    }
+                },
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        match err {
+            AppError::BatchFailed {
+                failed,
+                total,
+                skipped,
+                ..
+            } => {
+                assert_eq!(failed, 1, "only the probe was attempted");
+                assert_eq!(total, 100);
+                assert_eq!(skipped, 99);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no request may be sent once the probe has proven the pair unreachable"
+        );
+    }
+
+    /// An HTTP status failure is not proof of unreachability: the server may
+    /// simply be busy. The probe must not give up on the pair in that case.
+    #[tokio::test]
+    async fn a_status_failure_on_the_probe_does_not_abandon_the_pair() {
+        let attempts = Arc::new(Counter::new(0));
+        let counter = attempts.clone();
+        let err = batch_failed(
+            run_downloads_inner(
+                &client(),
+                tasks(100),
+                1,
                 &gate(1),
                 move |_: reqwest::Client, _: DownloadTask| {
                     let counter = counter.clone();
@@ -504,11 +920,34 @@ mod tests {
             .unwrap_err(),
         );
 
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            MAX_CONSECUTIVE_FAILURES,
-            "must stop attempting once the streak limit is reached"
+        match err {
+            AppError::BatchFailed { failed, .. } => {
+                assert_eq!(failed, BREAKER_WINDOW, "the window fills before it trips");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            attempts.load(Ordering::SeqCst) > 1,
+            "the probe must not abandon the pair on a status failure"
         );
+    }
+
+    /// The breaker opens once the recent attempts look unhealthy: a full
+    /// window of failures trips it and the remaining files are skipped.
+    #[tokio::test]
+    async fn the_breaker_opens_when_the_window_is_all_failures() {
+        let err = batch_failed(
+            run_downloads_inner(
+                &client(),
+                tasks(200),
+                1,
+                &gate(1),
+                |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
+            )
+            .await
+            .unwrap_err(),
+        );
+
         match err {
             AppError::BatchFailed {
                 failed,
@@ -516,9 +955,83 @@ mod tests {
                 skipped,
                 ..
             } => {
-                assert_eq!(failed, MAX_CONSECUTIVE_FAILURES);
-                assert_eq!(total, 20);
-                assert_eq!(skipped, 20 - MAX_CONSECUTIVE_FAILURES);
+                assert_eq!(total, 200);
+                assert_eq!(failed, BREAKER_WINDOW, "the window fills before it trips");
+                assert_eq!(skipped, 200 - BREAKER_WINDOW);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A 50% failure rate trips the breaker. A consecutive-failure counter
+    /// never could: every success reset it.
+    #[tokio::test]
+    async fn interleaved_failures_trip_the_breaker() {
+        let attempts = Arc::new(Counter::new(0));
+        let counter = attempts.clone();
+        let err = batch_failed(
+            run_downloads_inner(
+                &client(),
+                tasks(300),
+                1,
+                &gate(1),
+                move |_: reqwest::Client, t: DownloadTask| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                        if i % 2 == 0 { Err(boom()) } else { Ok(()) }
+                    }
+                },
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        match err {
+            AppError::BatchFailed {
+                failed,
+                total,
+                skipped,
+                ..
+            } => {
+                assert_eq!(total, 300);
+                assert!(skipped > 0, "a 50% failure rate must trip the breaker");
+                assert!(failed > 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A low failure rate keeps the breaker closed: an occasional hiccup must
+    /// not abandon a whole pair.
+    #[tokio::test]
+    async fn a_low_failure_rate_keeps_the_breaker_closed() {
+        let err = batch_failed(
+            run_downloads_inner(
+                &client(),
+                tasks(100),
+                1,
+                &gate(1),
+                |_: reqwest::Client, t: DownloadTask| async move {
+                    let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                    if i % 10 == 0 { Err(boom()) } else { Ok(()) }
+                },
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        match err {
+            AppError::BatchFailed {
+                failed,
+                total,
+                skipped,
+                ..
+            } => {
+                assert_eq!(total, 100);
+                assert_eq!(failed, 10);
+                assert_eq!(skipped, 0, "a 10% failure rate must not trip the breaker");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -526,53 +1039,30 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_files_are_never_counted_as_failures() {
-        // 5 failures trip the breaker; the remaining 15 must land in `skipped`.
-        let stats = run_downloads_inner(
-            &client(),
-            tasks(20),
-            1,
-            &gate(1),
-            |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
-        )
-        .await;
-        let stats = stats.unwrap_err();
-        match stats {
-            AppError::BatchFailed {
-                failed, skipped, ..
-            } => {
-                assert_eq!(failed, MAX_CONSECUTIVE_FAILURES);
-                assert_eq!(skipped, 15);
-                assert_ne!(failed, 20, "skipped must not inflate the failure count");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
+        // The window fills with failures; the remaining files must land in
+        // `skipped`, never in `failed`.
+        let err = batch_failed(
+            run_downloads_inner(
+                &client(),
+                tasks(200),
+                1,
+                &gate(1),
+                |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
+            )
+            .await
+            .unwrap_err(),
+        );
 
-    #[tokio::test]
-    async fn a_success_resets_the_failure_streak() {
-        // Fail 4, succeed 1, repeat: the streak never reaches 5, so nothing is
-        // skipped even though 24 of 30 tasks fail.
-        let stats = run_downloads_inner(
-            &client(),
-            tasks(30),
-            1,
-            &gate(1),
-            |_: reqwest::Client, t: DownloadTask| async move {
-                let n: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
-                if n % 5 == 4 { Ok(()) } else { Err(boom()) }
-            },
-        )
-        .await;
-
-        match batch_failed(stats.unwrap_err()) {
+        match err {
             AppError::BatchFailed {
-                failed, skipped, ..
+                failed,
+                total,
+                skipped,
+                ..
             } => {
-                assert_eq!(failed, 24);
-                assert_eq!(
-                    skipped, 0,
-                    "a reset streak must prevent the breaker opening"
-                );
+                assert_eq!(failed, BREAKER_WINDOW);
+                assert_eq!(skipped, total - BREAKER_WINDOW);
+                assert_ne!(failed, total, "skipped must not inflate the failure count");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -585,6 +1075,187 @@ mod tests {
             tasks(40),
             1,
             &gate(1),
+            |_: reqwest::Client, t: DownloadTask| async move {
+                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                if i % 20 == 0 {
+                    Err(AppError::NotFound { url: t.url })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        // 404s are expected answers, not failures: the breaker stays shut and
+        // every file is attempted.
+        assert_eq!(stats.not_found, 2);
+        assert_eq!(stats.ok, 38);
+        assert_eq!(stats.skipped, 0);
+    }
+
+    // — missing-range detection —
+
+    /// The bucket key names the calendar slot the file belongs to.
+    #[test]
+    fn the_bucket_key_uses_the_calendar_components() {
+        let d1 = task_for(
+            Timeframe::D1,
+            "/out/dukascopy/EURUSD/2025/BID_candles_day_1.bi5",
+            "a",
+        );
+        assert_eq!(bucket_key(&d1), "2025");
+
+        let h1 = task_for(
+            Timeframe::H1,
+            "/out/dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5",
+            "a",
+        );
+        assert_eq!(bucket_key(&h1), "2025/06");
+
+        let m1 = task_for(
+            Timeframe::M1,
+            "/out/dukascopy/EURUSD/2025/06/15/BID_candles_min_1.bi5",
+            "a",
+        );
+        assert_eq!(bucket_key(&m1), "2025/06/15");
+    }
+
+    #[test]
+    fn consecutive_missing_days_form_one_run() {
+        let mut keys = vec![
+            "2025/06/17".to_string(),
+            "2025/06/15".to_string(),
+            "2025/06/16".to_string(),
+        ];
+        assert_eq!(longest_missing_run(&mut keys, Timeframe::M1), 3);
+    }
+
+    /// A served day in between breaks the run.
+    #[test]
+    fn a_gap_breaks_the_run() {
+        let mut keys = vec!["2025/06/15".to_string(), "2025/06/17".to_string()];
+        assert_eq!(longest_missing_run(&mut keys, Timeframe::M1), 1);
+    }
+
+    #[test]
+    fn a_month_end_and_the_next_month_start_are_adjacent() {
+        let mut keys = vec!["2025/06/30".to_string(), "2025/07/01".to_string()];
+        assert_eq!(longest_missing_run(&mut keys, Timeframe::M1), 2);
+    }
+
+    #[test]
+    fn month_buckets_run_across_the_year() {
+        let mut keys = vec!["2025/12".to_string(), "2026/01".to_string()];
+        assert_eq!(longest_missing_run(&mut keys, Timeframe::H1), 2);
+    }
+
+    #[test]
+    fn year_buckets_run_across_the_year() {
+        let mut keys = vec!["2025".to_string(), "2026".to_string()];
+        assert_eq!(longest_missing_run(&mut keys, Timeframe::D1), 2);
+    }
+
+    /// A long stretch of consecutive missing buckets points outside the
+    /// feed's coverage even when the overall ratio is not extreme.
+    #[tokio::test]
+    async fn a_long_consecutive_gap_fails_even_at_a_modest_ratio() {
+        let err = run_downloads_inner(
+            &client(),
+            daily_tasks(20),
+            16,
+            &gate(16),
+            |_: reqwest::Client, t: DownloadTask| async move {
+                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                if i < 10 {
+                    Err(AppError::NotFound { url: t.url })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            AppError::RangeUnavailable {
+                not_found,
+                total,
+                longest_run,
+            } => {
+                assert_eq!(not_found, 10);
+                assert_eq!(total, 20);
+                assert_eq!(longest_run, 10, "the ten missing days are consecutive");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The feed publishes a file for every calendar day, so a large share of
+    /// 404s means the range lies outside its coverage. Reporting that as a
+    /// successful run would be actively misleading.
+    #[tokio::test]
+    async fn a_mostly_missing_range_is_reported_as_an_error() {
+        let err = run_downloads_inner(
+            &client(),
+            daily_tasks(20),
+            16,
+            &gate(16),
+            |_: reqwest::Client, _: DownloadTask| async {
+                Err(AppError::NotFound { url: "u".into() })
+            },
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            AppError::RangeUnavailable {
+                not_found,
+                total,
+                longest_run,
+            } => {
+                assert_eq!(not_found, 20);
+                assert_eq!(total, 20);
+                assert_eq!(longest_run, 20);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A small share of 404s is tolerated.
+    #[tokio::test]
+    async fn a_small_share_of_missing_files_is_tolerated() {
+        let stats = run_downloads_inner(
+            &client(),
+            daily_tasks(100),
+            16,
+            &gate(16),
+            |_: reqwest::Client, t: DownloadTask| async move {
+                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                if i % 20 == 0 {
+                    Err(AppError::NotFound { url: t.url })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.not_found, 5);
+        assert_eq!(stats.ok, 95);
+        assert_eq!(stats.failed, 0);
+    }
+
+    /// A tiny batch is warned about but never failed: a single missing file
+    /// must not take the whole run down.
+    #[tokio::test]
+    async fn a_tiny_batch_of_missing_files_is_not_an_error() {
+        let stats = run_downloads_inner(
+            &client(),
+            daily_tasks(3),
+            16,
+            &gate(16),
             |_: reqwest::Client, _: DownloadTask| async {
                 Err(AppError::NotFound { url: "u".into() })
             },
@@ -592,9 +1263,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(stats.not_found, 40);
-        assert_eq!(stats.skipped, 0, "404s are expected on holidays");
-        assert!(!stats.circuit_open());
+        assert_eq!(stats.not_found, 3);
+        assert_eq!(stats.ok, 0);
     }
 
     #[tokio::test]
@@ -692,5 +1362,48 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stats.ok, 1);
+    }
+
+    // — breaker semantics under concurrency —
+
+    /// Under concurrency the breaker still works: it is the *window* that
+    /// decides, not the order in which the failures happen.
+    #[tokio::test]
+    async fn the_breaker_opens_under_concurrency_too() {
+        let err = batch_failed(
+            run_downloads_inner(
+                &client(),
+                tasks(200),
+                30,
+                &gate(30),
+                |_: reqwest::Client, _: DownloadTask| async {
+                    // A real download awaits the network; without an await
+                    // point the future is Ready on first poll and the whole
+                    // batch degenerates into a serial loop.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    Err(boom())
+                },
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        match err {
+            AppError::BatchFailed {
+                failed,
+                total,
+                skipped,
+                ..
+            } => {
+                assert_eq!(total, 200);
+                assert!(
+                    failed >= BREAKER_WINDOW,
+                    "the window must fill before it trips: {failed}"
+                );
+                assert!(skipped > 0, "the breaker must stop the remaining files");
+                assert!(failed < total, "not every file may be attempted");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

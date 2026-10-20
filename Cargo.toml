@@ -1,5 +1,20 @@
 [workspace]
 
+# Lint policy lives here so it applies to *every* target: the library, the
+# binary and the integration tests. Crate-level `#![...]` attributes only
+# cover the crate that declares them, which used to leave `src/main.rs`
+# unconstrained.
+[workspace.lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
+
 [package]
 name = "dukascopy-data-downloader"
 version = "0.1.0"
@@ -7,6 +22,9 @@ edition = "2024"
 rust-version = "1.85"
 description = "Download raw Dukascopy historical kline (.bi5) files from the public Datafeed."
 license = "MIT"
+
+[lints]
+workspace = true
 
 [lib]
 name = "ddd"

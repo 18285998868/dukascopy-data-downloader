@@ -29,7 +29,12 @@ use crate::config::{AppConfig, Symbol, Timeframe};
 /// Maximum number of pair-level error details retained in the batch summary.
 const MAX_BATCH_ERRORS: usize = 20;
 /// TCP/TLS connect budget for a single request.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// 30s rather than something tighter: the handshake includes the TLS
+/// session, and a slow link to the data feed can spend a long time on it.
+/// A connect timeout that is too tight does not make the run faster, it just
+/// turns a slow download into a failed one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Total budget for a single request, including body download.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle-connection lifetime in the pool.
@@ -45,6 +50,8 @@ struct SharedRun {
     gate: Arc<Semaphore>,
     start: chrono::NaiveDate,
     end: chrono::NaiveDate,
+    /// Current UTC date, used to tell final buckets from unfinished ones.
+    today: chrono::NaiveDate,
 }
 
 /// Everything one pair needs, borrowed from a [`SharedRun`].
@@ -73,11 +80,45 @@ struct PairCtx<'a> {
 /// # }
 /// ```
 pub async fn run(config_path: &Path) -> Result<(), AppError> {
-    let cfg = AppConfig::load(config_path)?;
+    // Reading the file is blocking I/O; `spawn_blocking` keeps it off the
+    // async worker threads. The file is tiny, so the scheduling cost is in
+    // the same order as the read itself — but the worker never stalls.
+    let config_path = config_path.to_path_buf();
+    let cfg = tokio::task::spawn_blocking(move || AppConfig::load(&config_path))
+        .await
+        .map_err(AppError::from)??;
 
-    let client = build_client()?;
+    // Take the exclusive lock on the output directory. Two instances sharing
+    // one `output_dir` would delete each other's scratch files.
+    let output_dir = cfg.output_dir.clone();
+    let _lock =
+        tokio::task::spawn_blocking(move || crate::utils::run_lock::acquire_run_lock(&output_dir))
+            .await
+            .map_err(AppError::from)??;
+
+    // Resolve the range *before* any I/O: it is pure arithmetic, so a
+    // misconfigured range costs nothing instead of a full disk scan.
+    let today = chrono::Utc::now().date_naive();
+    let (start, end) = cfg.effective_range(today)?;
+
+    // A reversed range means every pair would be skipped anyway, so bail out
+    // before the disk is even scanned.
+    if start > end {
+        tracing::warn!(
+            start = %start,
+            end = %end,
+            "start date is after end date, nothing to download",
+        );
+        return Ok(());
+    }
+
+    // Building the client may touch the platform trust store, which is
+    // blocking file I/O — keep it off the worker threads too.
+    let client = tokio::task::spawn_blocking(build_client)
+        .await
+        .map_err(AppError::from)??;
+
     let local = crate::utils::scan_local_files::scan_local_files(&cfg.output_dir).await?;
-    let (start, end) = cfg.effective_range(chrono::Utc::now().date_naive())?;
     let concurrency = cfg.concurrency;
 
     tracing::info!(
@@ -99,19 +140,22 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
         local: Arc::new(local),
         start,
         end,
+        today,
     };
 
     let mut pairs = JoinSet::new();
-    let symbol_list = shared.cfg.symbol.clone();
-    let timeframe_list = shared.cfg.timeframe.clone();
-    for symbol in &symbol_list {
-        for timeframe in &timeframe_list {
+    // Borrow the config through its `Arc` instead of cloning the vectors out
+    // of it: `Vec<Symbol>` is a `Vec<String>`, so cloning it would allocate
+    // one `String` per symbol for no reason.
+    let cfg = Arc::clone(&shared.cfg);
+    for symbol in &cfg.symbol {
+        for timeframe in &cfg.timeframe {
             pairs.spawn(run_pair(shared.clone(), symbol.clone(), *timeframe));
         }
     }
 
     let mut failed_pairs = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::with_capacity(MAX_BATCH_ERRORS);
 
     while let Some(joined) = pairs.join_next().await {
         let (symbol, timeframe, result) = match joined {
@@ -119,9 +163,10 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
             Err(e) => {
                 // Covers panics and cancellation alike; either way this pair is lost.
                 failed_pairs += 1;
-                tracing::error!(is_panic = e.is_panic(), error = %e, "pair task did not complete");
+                let detail = describe_join_error(e);
+                tracing::error!(is_panic = detail.is_panic, error = %detail.message, "pair task did not complete");
                 if errors.len() < MAX_BATCH_ERRORS {
-                    errors.push(format!("task error: {e}"));
+                    errors.push(format!("task error: {}", detail.message));
                 }
                 continue;
             }
@@ -147,22 +192,59 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
     }
 
     tracing::error!(count = failed_pairs, "batch download completed with errors");
-    let truncated = if errors.len() < failed_pairs {
-        " (additional failures not listed)"
-    } else {
-        ""
-    };
-    Err(AppError::Data(format!(
-        "{} pair(s) failed: {}{truncated}",
-        failed_pairs,
-        errors.join("; ")
-    )))
+    let mut reasons = errors;
+    if reasons.len() < failed_pairs {
+        reasons.push(format!(
+            "{} additional failure(s) not listed",
+            failed_pairs - reasons.len()
+        ));
+    }
+    Err(AppError::PairsFailed {
+        failed: failed_pairs,
+        reasons,
+    })
+}
+
+/// A [`tokio::task::JoinError`] plus the panic payload it may carry.
+struct JoinFailure {
+    /// Whether the task died from a panic.
+    is_panic: bool,
+    /// Human-readable cause, including the panic message when there is one.
+    message: String,
+}
+
+/// Render a [`tokio::task::JoinError`], keeping the panic payload when there is one.
+///
+/// [`JoinError`]'s `Display` only says *that* a task panicked, never *why*:
+/// the message lives in the panic payload, which `Display` drops. Recovering
+/// it here is the difference between "task 7 panicked" and a usable bug
+/// report — the panic payload is the only place the original message exists
+/// once the task frame is gone.
+fn describe_join_error(err: tokio::task::JoinError) -> JoinFailure {
+    if !err.is_panic() {
+        return JoinFailure {
+            is_panic: false,
+            message: err.to_string(),
+        };
+    }
+    let summary = err.to_string();
+    let payload = err.into_panic();
+    let msg = payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    JoinFailure {
+        is_panic: true,
+        message: format!("{summary} (panic: {msg})"),
+    }
 }
 
 /// Download one symbol/timeframe pair and report which pair it was.
 ///
 /// The label is returned alongside the result because [`JoinSet`] yields
 /// completions out of order.
+#[tracing::instrument(skip(shared), fields(symbol = %symbol, timeframe = %timeframe))]
 async fn run_pair(
     shared: SharedRun,
     symbol: Symbol,
@@ -191,8 +273,9 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
         gate,
         start,
         end,
+        today,
     } = shared;
-    let (start, end) = (*start, *end);
+    let (start, end, today) = (*start, *end, *today);
 
     if start > end {
         tracing::warn!(
@@ -205,11 +288,27 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
         return Ok(());
     }
 
+    // Restrict this pair to buckets that are already final. The server keeps
+    // appending to an unfinished bucket, and the cache never re-downloads a
+    // file it already has — so an unfinished bucket would be frozen at
+    // whatever it held at download time, leaving a permanent hole.
+    let closed_end = build_urls::last_closed_day(timeframe, end, today);
+    if start > closed_end {
+        tracing::debug!(
+            symbol = %symbol,
+            timeframe = %timeframe,
+            start = %start,
+            end = %end,
+            "no finished bucket in the requested range, skipping",
+        );
+        return Ok(());
+    }
+
     tracing::info!(
         symbol = %symbol,
         timeframe = %timeframe,
         start = %start,
-        end = %end,
+        end = %closed_end,
         "processing symbol-timeframe pair",
     );
 
@@ -218,7 +317,7 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
         timeframe,
         cfg.price_type,
         start,
-        end,
+        closed_end,
         local,
         &cfg.output_dir,
     );
@@ -270,6 +369,7 @@ fn build_client() -> Result<reqwest::Client, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
     use std::path::PathBuf;
 
     /// Write a config whose `output_dir` is the temp dir, and pre-create the
@@ -288,10 +388,19 @@ mod tests {
         (dir, path)
     }
 
+    /// Write a config into a fresh temp directory and point `output_dir` at
+    /// it.
+    ///
+    /// Every test needs its own output directory: the run lock is taken per
+    /// directory, so tests sharing one would refuse to start.
     fn config(body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.toml");
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(
+            &path,
+            format!("{body}\noutput_dir = {:?}\n", dir.path().to_string_lossy()),
+        )
+        .unwrap();
         (dir, path)
     }
 
@@ -310,9 +419,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_rejects_an_oversized_effective_range_before_any_request() {
-        let (_dir, path) = config(
-            "symbol = [\"EURUSD\"]\ntimeframe = [\"M1\"]\nstart = \"1900-01-01\"\noutput_dir = \"/tmp/ddd-never-used\"\n",
-        );
+        let (_dir, path) =
+            config("symbol = [\"EURUSD\"]\ntimeframe = [\"M1\"]\nstart = \"1900-01-01\"\n");
         let err = run(&path).await.unwrap_err();
         assert!(err.to_string().contains("exceeding maximum"), "{err}");
     }
@@ -342,5 +450,64 @@ mod tests {
             "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"2999-01-01\"\nend = \"2999-12-31\"\n",
         );
         run(&path).await.unwrap();
+    }
+
+    /// A D1 range inside the current year has no finished bucket yet: the
+    /// year file is still being written, so nothing is requested.
+    #[tokio::test]
+    async fn run_skips_a_year_bucket_that_is_still_open() {
+        let today = chrono::Utc::now().date_naive();
+        let year = today.year();
+        let (_dir, path) = config(&format!(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"{year}-01-01\"\nend = \"{year}-06-30\"\n"
+        ));
+        run(&path).await.unwrap();
+    }
+
+    /// The same for the H1 file of the month that is still running.
+    #[tokio::test]
+    async fn run_skips_a_month_bucket_that_is_still_open() {
+        let today = chrono::Utc::now().date_naive();
+        let first_of_month = today.with_day(1).unwrap();
+        let (_dir, path) = config(&format!(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"H1\"]\nstart = \"{first_of_month}\"\n"
+        ));
+        run(&path).await.unwrap();
+    }
+
+    // — join-error reporting —
+
+    /// A panicked task must report *why* it panicked. `JoinError`'s `Display`
+    /// drops the payload, so the message has to be recovered explicitly.
+    ///
+    /// The default panic hook prints the panic to stderr; that noise is
+    /// expected here and does not indicate a failure.
+    #[tokio::test]
+    async fn describe_join_error_recovers_the_panic_message() {
+        let handle = tokio::spawn(async { panic!("kaboom") });
+        let err = handle.await.unwrap_err();
+
+        let failure = describe_join_error(err);
+        assert!(failure.is_panic);
+        assert!(
+            failure.message.contains("kaboom"),
+            "panic payload lost: {}",
+            failure.message
+        );
+    }
+
+    /// A cancelled task carries no payload and must not be mislabelled as a
+    /// panic.
+    #[tokio::test]
+    async fn describe_join_error_does_not_claim_a_panic_for_cancellation() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        let err = handle.await.unwrap_err();
+
+        let failure = describe_join_error(err);
+        assert!(!failure.is_panic);
+        assert!(!failure.message.is_empty());
     }
 }

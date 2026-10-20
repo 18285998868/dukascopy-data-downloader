@@ -117,7 +117,7 @@ fn next_bucket(d: NaiveDate, period: PeriodKind, last: NaiveDate) -> Option<Naiv
     Some(match period {
         // Both bounds are years taken from real NaiveDates, so +1 stays in range.
         PeriodKind::Year => {
-            NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).expect("year step stays in range")
+            NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).expect("BUG: year step stays in range")
         }
         PeriodKind::Month => {
             let (y, m) = if d.month() == 12 {
@@ -125,7 +125,7 @@ fn next_bucket(d: NaiveDate, period: PeriodKind, last: NaiveDate) -> Option<Naiv
             } else {
                 (d.year(), d.month() + 1)
             };
-            NaiveDate::from_ymd_opt(y, m, 1).expect("month step stays in range")
+            NaiveDate::from_ymd_opt(y, m, 1).expect("BUG: month step stays in range")
         }
         PeriodKind::Day => d.succ_opt()?,
     })
@@ -134,9 +134,9 @@ fn next_bucket(d: NaiveDate, period: PeriodKind, last: NaiveDate) -> Option<Naiv
 /// Truncate `date` down to the start of its bucket and normalise `end` the same way.
 fn bucket_bounds(start: NaiveDate, end: NaiveDate, period: PeriodKind) -> (NaiveDate, NaiveDate) {
     let floor = |d: NaiveDate| match period {
-        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year(), 1, 1).expect("year is in range"),
+        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year(), 1, 1).expect("BUG: year is in range"),
         PeriodKind::Month => {
-            NaiveDate::from_ymd_opt(d.year(), d.month(), 1).expect("month is in range")
+            NaiveDate::from_ymd_opt(d.year(), d.month(), 1).expect("BUG: month is in range")
         }
         PeriodKind::Day => d,
     };
@@ -156,6 +156,66 @@ fn bucket_dates(
     // yearly bucket, where both floors are `2025-01-01`.
     let seed = (start <= end).then_some(first);
     std::iter::successors(seed, move |d| next_bucket(*d, period, last))
+}
+
+/// The last calendar day of the month `date` falls in.
+pub(crate) fn last_day_of_month(date: NaiveDate) -> NaiveDate {
+    let (y, m) = (date.year(), date.month());
+    let first_of_next = if m == 12 {
+        NaiveDate::from_ymd_opt(y + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(y, m + 1, 1)
+    };
+    first_of_next.and_then(|d| d.pred_opt()).unwrap_or(date)
+}
+
+/// The last calendar day of the month *before* the one `date` falls in.
+pub(crate) fn previous_month_last_day(date: NaiveDate) -> NaiveDate {
+    let (y, m) = (date.year(), date.month());
+    let (py, pm) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+    last_day_of_month(NaiveDate::from_ymd_opt(py, pm, 1).unwrap_or(date))
+}
+
+/// The last day that a *closed* bucket of this timeframe can cover.
+///
+/// A bucket is one file: one day for `M1`, one month for `H1`, one year for
+/// `D1`. The server keeps appending to a bucket until the last calendar day
+/// it covers has ended, so a bucket is only final afterwards. Downloading an
+/// unfinished bucket caches a file that will never be updated again — the
+/// missing tail becomes a permanent hole in the data.
+///
+/// `end` is the requested upper bound (already clamped to yesterday by
+/// [`crate::config::AppConfig::resolved_end`]); `today` is the current UTC
+/// date.
+///
+/// The result is never greater than `end`, and it is the *end of the last
+/// closed bucket* — so a range whose buckets are all still open yields a
+/// value below `start`, which callers treat as "nothing to download".
+pub(crate) fn last_closed_day(tf: Timeframe, end: NaiveDate, today: NaiveDate) -> NaiveDate {
+    match tf {
+        // The day bucket closes at midnight, and `end` is already in the
+        // past, so it is closed by construction.
+        Timeframe::M1 => end,
+        Timeframe::H1 => {
+            let month_end = last_day_of_month(end);
+            if month_end < today {
+                end
+            } else {
+                // The month is still running: fall back to the previous one.
+                previous_month_last_day(month_end)
+            }
+        }
+        Timeframe::D1 => {
+            let year_end =
+                last_day_of_month(NaiveDate::from_ymd_opt(end.year(), 12, 1).unwrap_or(end));
+            if year_end < today {
+                end
+            } else {
+                // The year is still running: fall back to the previous one.
+                NaiveDate::from_ymd_opt(end.year() - 1, 12, 31).unwrap_or(end)
+            }
+        }
+    }
 }
 
 /// Generate download URLs for a single symbol/timeframe pair, lazily.
@@ -457,6 +517,76 @@ mod tests {
         )
         .count();
         assert_eq!(n, 365, "2023 is not a leap year");
+    }
+
+    // — closed buckets —
+
+    #[test]
+    fn a_day_bucket_is_closed_as_soon_as_the_day_is_over() {
+        let end = date(2026, 10, 19);
+        assert_eq!(last_closed_day(Timeframe::M1, end, date(2026, 10, 20)), end);
+    }
+
+    /// The requested range ends inside October, but October's file is still
+    /// being written — the last closed month is September.
+    #[test]
+    fn a_month_bucket_is_not_closed_while_the_month_runs() {
+        assert_eq!(
+            last_closed_day(Timeframe::H1, date(2026, 10, 19), date(2026, 10, 20)),
+            date(2026, 9, 30)
+        );
+    }
+
+    #[test]
+    fn a_month_bucket_is_closed_once_the_month_is_over() {
+        let end = date(2026, 9, 30);
+        assert_eq!(last_closed_day(Timeframe::H1, end, date(2026, 10, 20)), end);
+    }
+
+    #[test]
+    fn a_year_bucket_is_not_closed_while_the_year_runs() {
+        assert_eq!(
+            last_closed_day(Timeframe::D1, date(2026, 10, 19), date(2026, 10, 20)),
+            date(2025, 12, 31)
+        );
+    }
+
+    #[test]
+    fn a_year_bucket_is_closed_once_the_year_is_over() {
+        let end = date(2025, 6, 30);
+        assert_eq!(last_closed_day(Timeframe::D1, end, date(2026, 10, 20)), end);
+    }
+
+    /// The closed bound must never exceed the requested one, whatever the
+    /// timeframe and the date.
+    #[test]
+    fn last_closed_day_never_exceeds_the_requested_end() {
+        for tf in [Timeframe::M1, Timeframe::H1, Timeframe::D1] {
+            for end in [date(2026, 1, 1), date(2026, 10, 19), date(2025, 12, 31)] {
+                let closed = last_closed_day(tf, end, date(2026, 10, 20));
+                assert!(closed <= end, "{tf:?}: {closed} is after {end}");
+            }
+        }
+    }
+
+    #[test]
+    fn last_day_of_month_handles_december_and_leap_years() {
+        assert_eq!(last_day_of_month(date(2026, 12, 5)), date(2026, 12, 31));
+        assert_eq!(last_day_of_month(date(2024, 2, 5)), date(2024, 2, 29));
+        assert_eq!(last_day_of_month(date(2026, 1, 31)), date(2026, 1, 31));
+    }
+
+    #[test]
+    fn previous_month_last_day_rolls_over_the_year() {
+        assert_eq!(
+            previous_month_last_day(date(2026, 10, 19)),
+            date(2026, 9, 30)
+        );
+        assert_eq!(
+            previous_month_last_day(date(2026, 1, 15)),
+            date(2025, 12, 31)
+        );
+        assert_eq!(previous_month_last_day(date(2024, 3, 1)), date(2024, 2, 29));
     }
 
     // — timeframe mapping —

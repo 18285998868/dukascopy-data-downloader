@@ -10,12 +10,29 @@ const TMP_SUFFIX: &[u8] = b".bi5.tmp";
 /// Final payload suffix.
 const BI5_SUFFIX: &[u8] = b".bi5";
 
+/// The cache key of a scanned file.
+///
+/// The key has to match the relative paths produced by
+/// [`crate::app::build_urls::build_urls`], which always join with `/`. A
+/// path read back from the filesystem carries the native separator, so on
+/// Windows it would never match and the cache would silently be defeated —
+/// every run would download everything again.
+fn cache_key(rel: &Path) -> String {
+    let raw = rel.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '/' {
+        raw.into_owned()
+    } else {
+        raw.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
 /// Scan `data_dir` for existing `.bi5` files, removing stale `.bi5.tmp` files.
 ///
 /// Returns a set of `data_dir`-relative paths (e.g.
 /// `dukascopy/EURUSD/2025/BID_candles_day_1.bi5`), which is exactly the shape
 /// produced by [`crate::app::build_urls::build_urls`], so callers can test
-/// membership directly. A missing directory yields an empty set.
+/// membership directly. Paths always use `/` as the separator, on every
+/// platform. A missing directory yields an empty set.
 ///
 /// Only `*.bi5.tmp` scratch files are deleted — a blanket `*.tmp` sweep would
 /// destroy unrelated temporary files if `data_dir` ever points somewhere shared.
@@ -69,7 +86,7 @@ pub async fn scan_local_files(data_dir: &Path) -> Result<HashSet<String>, AppErr
             }
 
             if name.ends_with(BI5_SUFFIX) {
-                files.insert(rel.to_string_lossy().into_owned());
+                files.insert(cache_key(rel));
             }
         }
         Ok::<_, AppError>(files)
@@ -190,5 +207,14 @@ mod tests {
         for rel in expected {
             assert!(files.contains(&rel), "{rel}");
         }
+    }
+
+    /// The cache key must use the same separator as the paths the task
+    /// builder produces, otherwise the lookup never matches.
+    #[test]
+    fn the_cache_key_uses_forward_slashes() {
+        let key = cache_key(Path::new("dukascopy/EURUSD/2025/BID_candles_day_1.bi5"));
+        assert_eq!(key, "dukascopy/EURUSD/2025/BID_candles_day_1.bi5");
+        assert!(!key.contains(std::path::MAIN_SEPARATOR) || std::path::MAIN_SEPARATOR == '/');
     }
 }
