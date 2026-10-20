@@ -19,7 +19,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = ddd::cli::parse();
 
     // Run the download pipeline, annotating any error with pipeline context.
-    ddd::app::run(&cli.config)
+    let opts = ddd::app::download::DownloadOptions {
+        allow_missing: cli.allow_missing,
+    };
+    ddd::app::run_with(&cli.config, &opts)
         .await
         .context("dukascopy-data-downloader run failed")?;
     Ok(())

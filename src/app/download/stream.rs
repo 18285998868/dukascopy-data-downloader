@@ -1,6 +1,6 @@
 //! Streaming download of a single `.bi5` payload.
 //!
-//! The response body is written straight to a `.bi5.tmp` sibling, flushed to
+//! The response body is written straight to a `.bi5.tmp` sibling, synced to
 //! stable storage, and only then atomically renamed into place. The payload is
 //! therefore never visible under its final name while incomplete, a retry never
 //! appends to stale bytes, and a crash cannot leave a truncated file that the
@@ -205,12 +205,13 @@ async fn download_to_file_with_backoff(
                     .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
             }
 
-            // `flush` only hands the bytes to the kernel. Without `sync_all` a
-            // power loss could leave a renamed-but-empty `.bi5`, which the
-            // cache scan treats as complete forever.
-            file.flush()
-                .await
-                .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+            // `sync_all` is what actually hands the bytes to the disk: it
+            // flushes the operating system's buffers and waits for the
+            // storage to acknowledge. (`flush` on a `File` is a no-op, and
+            // it would only cost an extra hop through the blocking pool.)
+            // Without the `sync_all` a power loss could leave a
+            // renamed-but-empty `.bi5`, which the cache scan treats as
+            // complete forever.
             file.sync_all()
                 .await
                 .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
@@ -224,9 +225,29 @@ async fn download_to_file_with_backoff(
             // directory entry created by the rename is still in the page
             // cache. Without this fsync a power loss can undo the rename
             // itself, leaving the payload behind under its scratch name.
+            //
+            // A failure here is not a download failure: the payload is on
+            // disk, only the durability of the *rename* is in question.
+            // Some filesystems refuse to open a directory at all, so the
+            // error is logged rather than propagated.
             if let Some(parent) = dest.parent() {
-                if let Ok(dir) = tokio::fs::File::open(parent).await {
-                    let _ = dir.sync_all().await;
+                match tokio::fs::File::open(parent).await {
+                    Ok(dir) => {
+                        if let Err(e) = dir.sync_all().await {
+                            tracing::debug!(
+                                path = %parent.display(),
+                                error = %e,
+                                "could not fsync the parent directory; the rename may not be durable",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            path = %parent.display(),
+                            error = %e,
+                            "could not open the parent directory for fsync; the rename may not be durable",
+                        );
+                    }
                 }
             }
 
@@ -369,6 +390,16 @@ mod tests {
         assert_eq!(parse_retry_after("1.5"), None);
     }
 
+    /// A huge hint is reported as-is; the *clamping* against the retry
+    /// budget is the operation's job, not the parser's.
+    #[test]
+    fn parse_retry_after_accepts_a_huge_delta() {
+        assert_eq!(
+            parse_retry_after("86400"),
+            Some(Duration::from_secs(86_400))
+        );
+    }
+
     // — scratch path —
 
     #[test]
@@ -384,6 +415,16 @@ mod tests {
         assert_eq!(
             tmp_path_for(std::path::Path::new("/d/EUR.USD/x.bi5")),
             PathBuf::from("/d/EUR.USD/x.bi5.tmp")
+        );
+    }
+
+    /// A destination without an extension still gets a scratch file that
+    /// cannot be mistaken for the payload.
+    #[test]
+    fn tmp_path_of_an_extensionless_destination() {
+        assert_eq!(
+            tmp_path_for(std::path::Path::new("/d/BID_candles_day_1")),
+            PathBuf::from("/d/BID_candles_day_1.bi5.tmp")
         );
     }
 

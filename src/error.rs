@@ -125,6 +125,21 @@ pub enum AppError {
         longest_run: usize,
     },
 
+    /// The run was interrupted by a termination signal (Ctrl+C / SIGTERM).
+    ///
+    /// Not a failure of the download itself: the batch is abandoned, the
+    /// files already written stay on disk, and the run lock is released so
+    /// the next run can start without a manual cleanup.
+    ///
+    /// The run still exits non-zero — an interrupted run did not deliver
+    /// the requested range, and a caller that only looks at the exit code
+    /// must not mistake it for a complete download.
+    #[error("interrupted by {signal}; the run was cancelled and the run lock was released")]
+    Interrupted {
+        /// Name of the signal that cancelled the run.
+        signal: &'static str,
+    },
+
     /// Tokio task join error.
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
@@ -311,5 +326,41 @@ mod tests {
             "the source chain must survive: {}",
             err.chain()
         );
+    }
+
+    /// The unavailable-range error must state all three numbers: how many
+    /// files were missing, how many were requested, and how long the
+    /// longest consecutive gap was.
+    #[test]
+    fn range_unavailable_reports_the_counts() {
+        let err = AppError::RangeUnavailable {
+            not_found: 50,
+            total: 100,
+            longest_run: 42,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("50/100"), "{msg}");
+        assert!(msg.contains("42"), "{msg}");
+        assert!(msg.contains("coverage"), "{msg}");
+    }
+
+    /// The chain of an error without a source is just its own message.
+    #[test]
+    fn the_chain_of_a_flat_error_is_not_padded() {
+        let err = AppError::NotFound {
+            url: "https://example.invalid/x.bi5".into(),
+        };
+        assert_eq!(err.chain(), "not found: https://example.invalid/x.bi5");
+    }
+
+    /// An interruption has to say which signal caused it and that the lock
+    /// was released — the user has to be able to start the next run right
+    /// away.
+    #[test]
+    fn an_interruption_names_the_signal_and_the_lock_release() {
+        let err = AppError::Interrupted { signal: "SIGINT" };
+        let msg = err.to_string();
+        assert!(msg.contains("SIGINT"), "{msg}");
+        assert!(msg.contains("run lock was released"), "{msg}");
     }
 }

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::AppError;
 
 /// Name of the lock directory created inside the output directory.
-const LOCK_DIR_NAME: &str = ".ddd.lock";
+pub const LOCK_DIR_NAME: &str = ".ddd.lock";
 
 /// A held run lock.
 ///
@@ -39,9 +39,20 @@ impl RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        // Nothing useful can be done about a failure here, and the run is
-        // over either way.
-        let _ = std::fs::remove_dir(&self.path);
+        // Nothing can be done about a failure here — the run is over
+        // either way — but it must not pass unnoticed: the leftover
+        // directory makes the *next* run refuse to start, and without this
+        // warning that refusal looks like a stuck process rather than a
+        // stale directory.
+        if let Err(e) = std::fs::remove_dir(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "could not remove the run lock; remove it manually before the next run",
+                );
+            }
+        }
     }
 }
 
@@ -111,5 +122,67 @@ mod tests {
         let lock = acquire_run_lock(dir.path()).unwrap();
         assert!(lock.path().starts_with(dir.path()));
         assert!(lock.path().is_dir());
+    }
+
+    /// The refusal must name the directory the user has to remove.
+    ///
+    /// A crashed run leaves the lock behind; the next run then refuses to
+    /// start. Without the path in the message the remedy is guesswork.
+    #[test]
+    fn the_refusal_names_the_directory_to_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = acquire_run_lock(dir.path()).unwrap();
+        let err = acquire_run_lock(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(LOCK_DIR_NAME), "{msg}");
+        assert!(
+            msg.contains(&dir.path().to_string_lossy().into_owned()),
+            "{msg}"
+        );
+    }
+
+    /// The output directory is created on demand: the lock is the first
+    /// thing a run touches.
+    #[test]
+    fn the_output_directory_is_created_if_it_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-there-yet");
+        let lock = acquire_run_lock(&missing).unwrap();
+        assert!(missing.is_dir());
+        assert!(lock.path().is_dir());
+    }
+
+    /// Aborting the task that holds the lock must release it.
+    ///
+    /// This is the path an interruption takes: the pipeline future is
+    /// dropped, and the lock guard lives inside that future. If the guard
+    /// were not released here, the next run would refuse to start with a
+    /// stale lock — the exact problem the lock was meant to avoid.
+    #[tokio::test]
+    async fn aborting_the_holder_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCK_DIR_NAME);
+
+        let handle = tokio::spawn(async move {
+            let _lock = acquire_run_lock(dir.path()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        // Wait until the lock has actually been taken.
+        for _ in 0..100 {
+            if lock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(lock_path.exists(), "the task must have taken the lock");
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !lock_path.exists(),
+            "an aborted holder must release the lock"
+        );
     }
 }

@@ -23,18 +23,22 @@ use futures::StreamExt;
 const PROGRESS_EVERY: usize = 100;
 /// Maximum number of individual failure details retained in the batch summary.
 const MAX_REPORTED_FAILURES: usize = 20;
-/// Fraction of "not found" answers above which the batch is warned about.
+/// Numerator of the "not found" ratio above which the batch is warned about.
 ///
 /// Dukascopy publishes a file for every calendar day — weekends and
 /// holidays included — so a missing file is not a normal holiday. A
 /// noticeable share of 404s means the requested range reaches beyond the
 /// feed's coverage.
-const NOT_FOUND_WARN_RATIO: f64 = 0.05;
-/// Fraction of "not found" answers above which the batch fails.
+const NOT_FOUND_WARN_NUM: usize = 1;
+/// Denominator of [`NOT_FOUND_WARN_NUM`]: 1/20 = 5%.
+const NOT_FOUND_WARN_DEN: usize = 20;
+/// Numerator of the "not found" ratio above which the batch fails.
 ///
 /// Past this point the run almost certainly downloaded nothing useful, and
 /// reporting success would be actively misleading.
-const NOT_FOUND_FAIL_RATIO: f64 = 0.50;
+const NOT_FOUND_FAIL_NUM: usize = 1;
+/// Denominator of [`NOT_FOUND_FAIL_NUM`]: 1/2 = 50%.
+const NOT_FOUND_FAIL_DEN: usize = 2;
 /// Smallest batch for which the 404 ratio is meaningful.
 ///
 /// With only a handful of files the ratio is dominated by a single missing
@@ -54,8 +58,47 @@ const MISSING_RUN_FAIL_LEN: usize = 5;
 /// a pair may fail on, and a cap below the reason limit would make the
 /// limit unreachable.
 const BREAKER_WINDOW: usize = 32;
-/// Failure ratio inside the window that opens the breaker.
-const BREAKER_FAIL_RATIO: f64 = 0.5;
+/// Failure ratio inside the window that opens the breaker: 1/2 = 50%.
+const BREAKER_FAIL_NUM: usize = 1;
+/// Denominator of [`BREAKER_FAIL_NUM`].
+const BREAKER_FAIL_DEN: usize = 2;
+
+/// Compare the fraction `part`/`whole` against the exact fraction `num`/`den`.
+///
+/// Returns [`Ordering::Greater`] when `part`/`whole` is strictly greater
+/// than `num`/`den`.
+///
+/// The comparison is integer arithmetic on purpose: both sides are counts
+/// and the thresholds are exact fractions, so a float division would only
+/// add rounding to a comparison that does not need it — and would make the
+/// boundary cases ("exactly 5%") depend on the binary representation of
+/// the threshold.
+fn cmp_ratio(part: usize, whole: usize, num: usize, den: usize) -> std::cmp::Ordering {
+    (part * den).cmp(&(whole * num))
+}
+
+/// Options that control how a batch reacts to a range the feed does not have.
+///
+/// The default is the strict behaviour: a requested range that is (largely)
+/// absent from the feed fails the run. The opt-out exists for the
+/// "fetch whatever is there" workflow, which the strict default cannot
+/// serve — the feed lags behind the market by weeks, so *any* range that
+/// reaches into the lag zone would otherwise fail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DownloadOptions {
+    /// Tolerate a requested range that is missing from the data feed.
+    ///
+    /// When `false` (the default) a batch whose range is largely absent
+    /// fails with [`AppError::RangeUnavailable`]. When `true` the same
+    /// situation is only logged and the run finishes with whatever the feed
+    /// did have.
+    ///
+    /// This covers the *range* checks only — the share of 404s and the
+    /// longest consecutive gap. A file that actually failed to download (a
+    /// transport error, a 5xx that outlived the retry budget) still fails
+    /// the batch: that is a broken download, not a range the feed lacks.
+    pub allow_missing: bool,
+}
 
 /// Outcome of one task inside a batch.
 #[derive(Debug)]
@@ -65,8 +108,8 @@ enum TaskOutcome {
     /// The server does not have this file (HTTP 404), with the bucket it was
     /// missing for.
     NotFound {
-        /// Key of the bucket the file belongs to.
-        bucket: String,
+        /// Calendar slot the file was missing from.
+        bucket: MissingBucket,
     },
     /// Failed for any other reason.
     Failed(AppError),
@@ -74,12 +117,26 @@ enum TaskOutcome {
     Skipped,
 }
 
+/// A calendar slot a file was expected in, but the feed does not have it.
+///
+/// The timeframe is part of the value because it defines the slot's
+/// granularity: a `D1` bucket is a whole year, an `H1` bucket a month and
+/// an `M1` bucket a day. Two buckets are only comparable when they share
+/// that granularity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingBucket {
+    /// Timeframe whose calendar the bucket belongs to.
+    timeframe: Timeframe,
+    /// Bucket key within that calendar, e.g. `2025/06/15`.
+    key: String,
+}
+
 /// The bucket key of a task's destination.
 ///
 /// The trailing *directory* components identify the bucket: the year for
 /// `D1`, year and month for `H1`, year, month and day for `M1`. They are
 /// fixed-width numbers, so the keys order chronologically as strings.
-fn bucket_key(task: &DownloadTask) -> String {
+fn bucket_key(task: &DownloadTask) -> MissingBucket {
     let depth = match task.timeframe {
         Timeframe::D1 => 1,
         Timeframe::H1 => 2,
@@ -94,7 +151,10 @@ fn bucket_key(task: &DownloadTask) -> String {
         .rev()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    parts.join("/")
+    MissingBucket {
+        timeframe: task.timeframe,
+        key: parts.join("/"),
+    }
 }
 
 /// The calendar position of a bucket key, as `(year, month, day)`.
@@ -137,26 +197,48 @@ fn is_adjacent_bucket(a: (i32, u32, u32), b: (i32, u32, u32), timeframe: Timefra
 
 /// The longest run of consecutively missing buckets.
 ///
-/// The keys are sorted chronologically and every neighbouring pair is
-/// checked for calendar adjacency: the run only continues when no calendar
-/// slot in between was actually served.
-fn longest_missing_run(keys: &mut Vec<String>, timeframe: Timeframe) -> usize {
-    if keys.is_empty() {
+/// The buckets are grouped by timeframe *first*: a `D1` bucket is keyed by
+/// its year while an `M1` bucket is keyed by a full date, so mixing the two
+/// in one sorted list would compare incomparable keys — and a `D1` run of
+/// three years would be read as three consecutive *days* of a different
+/// granularity. Within a group the keys are sorted chronologically and
+/// every neighbouring pair is checked for calendar adjacency: the run only
+/// continues when no calendar slot in between was actually served.
+fn longest_missing_run(buckets: &[MissingBucket]) -> usize {
+    let mut longest = 0;
+    for timeframe in [Timeframe::M1, Timeframe::H1, Timeframe::D1] {
+        let keys: Vec<String> = buckets
+            .iter()
+            .filter(|b| b.timeframe == timeframe)
+            .map(|b| b.key.clone())
+            .collect();
+        longest = longest.max(longest_run_in(&keys, timeframe));
+    }
+    longest
+}
+
+/// The longest run of consecutive missing buckets within one timeframe.
+///
+/// Only keys that can be *placed on the calendar* take part. A key that
+/// does not parse belongs to a destination that does not mirror the server
+/// layout; such a bucket can neither extend a run nor break one, so it is
+/// left out instead of silently truncating a real gap.
+fn longest_run_in(keys: &[String], timeframe: Timeframe) -> usize {
+    // Sorting the *parsed positions* (rather than the key strings) puts the
+    // buckets in calendar order and makes the duplicate removal exact.
+    let mut positions: Vec<(i32, u32, u32)> = keys
+        .iter()
+        .filter_map(|k| bucket_position(k, timeframe))
+        .collect();
+    if positions.is_empty() {
         return 0;
     }
-    keys.sort();
-    keys.dedup();
+    positions.sort_unstable();
+    positions.dedup();
     let mut longest = 1;
     let mut current = 1;
-    for pair in keys.windows(2) {
-        let adjacent = match (
-            bucket_position(&pair[0], timeframe),
-            bucket_position(&pair[1], timeframe),
-        ) {
-            (Some(a), Some(b)) => is_adjacent_bucket(a, b, timeframe),
-            _ => false,
-        };
-        if adjacent {
+    for pair in positions.windows(2) {
+        if is_adjacent_bucket(pair[0], pair[1], timeframe) {
             current += 1;
             longest = longest.max(current);
         } else {
@@ -212,7 +294,9 @@ impl Breaker {
             return self.open.load(Ordering::Relaxed);
         }
         let failures = window.iter().filter(|&&ok| !ok).count();
-        if failures as f64 / window.len() as f64 >= BREAKER_FAIL_RATIO {
+        if cmp_ratio(failures, window.len(), BREAKER_FAIL_NUM, BREAKER_FAIL_DEN)
+            != std::cmp::Ordering::Less
+        {
             self.open.store(true, Ordering::Relaxed);
         }
         self.open.load(Ordering::Relaxed)
@@ -240,6 +324,29 @@ fn is_transport_failure(err: &AppError) -> bool {
 }
 
 /// Aggregate statistics for a completed batch of downloads.
+///
+/// The four outcome counters are mutually exclusive and add up to
+/// [`DownloadStats::total`]: every task of the batch ended in exactly one
+/// of them.
+///
+/// # Examples
+///
+/// ```
+/// use ddd::app::download::DownloadStats;
+///
+/// let stats = DownloadStats {
+///     total: 10,
+///     ok: 7,
+///     not_found: 2,
+///     failed: 1,
+///     skipped: 0,
+/// };
+/// // The counters are mutually exclusive and add up to `total`.
+/// assert_eq!(
+///     stats.ok + stats.not_found + stats.failed + stats.skipped,
+///     stats.total
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DownloadStats {
     /// Number of tasks in the batch.
@@ -268,11 +375,23 @@ impl DownloadStats {
 
 /// Download all tasks, bounded by the shared `gate`.
 ///
+/// The batch is the unit of every per-batch decision: the probe, the
+/// circuit breaker and the "the range is not in the feed" analysis all
+/// look at the whole batch at once.
+///
+/// Tasks may mix timeframes. The missing-range analysis then measures the
+/// longest run of consecutive missing buckets **within each timeframe's
+/// own calendar** — a `D1` gap is counted in years, an `M1` gap in days —
+/// and reports the longest of them. Mixing the two key spaces would make
+/// a three-year gap look like three unrelated days.
+///
 /// # Errors
 ///
 /// Returns [`AppError::BatchFailed`] carrying a bounded sample of per-file
 /// causes when any task fails; a task answered with 404 is counted in
-/// [`DownloadStats::not_found`] and does **not** fail the batch.
+/// [`DownloadStats::not_found`] and does **not** fail the batch. Returns
+/// [`AppError::RangeUnavailable`] when the requested range is (largely)
+/// absent from the feed.
 ///
 /// # Examples
 ///
@@ -302,6 +421,54 @@ pub async fn run_downloads(
     run_downloads_inner(client, tasks, concurrency, gate, download_fn).await
 }
 
+/// Download all tasks, bounded by the shared `gate`, with explicit options.
+///
+/// This is [`run_downloads`] plus the options that decide what happens to
+/// a range the feed does not have; see [`DownloadOptions::allow_missing`].
+///
+/// # Errors
+///
+/// Returns [`AppError::BatchFailed`] when any task fails, and
+/// [`AppError::RangeUnavailable`] when the requested range is (largely)
+/// absent from the feed and [`DownloadOptions::allow_missing`] is not set.
+pub async fn run_downloads_with(
+    client: &reqwest::Client,
+    tasks: Vec<DownloadTask>,
+    concurrency: usize,
+    gate: &Arc<Semaphore>,
+    opts: &DownloadOptions,
+) -> Result<DownloadStats, AppError> {
+    let download_fn = move |c: reqwest::Client, t: DownloadTask| async move {
+        stream::download_to_file(&c, &t).await
+    };
+    run_downloads_inner_with(client, tasks, concurrency, gate, *opts, download_fn).await
+}
+
+/// Core download orchestration with the default (strict) options.
+///
+/// Parameterized by the download function for testing.
+async fn run_downloads_inner<F, Fut>(
+    client: &reqwest::Client,
+    tasks: Vec<DownloadTask>,
+    concurrency: usize,
+    gate: &Arc<Semaphore>,
+    download_fn: F,
+) -> Result<DownloadStats, AppError>
+where
+    F: Fn(reqwest::Client, DownloadTask) -> Fut,
+    Fut: Future<Output = Result<(), AppError>>,
+{
+    run_downloads_inner_with(
+        client,
+        tasks,
+        concurrency,
+        gate,
+        DownloadOptions::default(),
+        download_fn,
+    )
+    .await
+}
+
 /// Core download orchestration, parameterized by the download function for testing.
 ///
 /// The first file is downloaded **on its own** before the rest are released.
@@ -314,11 +481,12 @@ pub async fn run_downloads(
 /// The breaker closes the batch when the recent attempts look unhealthy: its
 /// window opens on a failure ratio, and a transport failure on the probe
 /// trips it outright.
-async fn run_downloads_inner<F, Fut>(
+async fn run_downloads_inner_with<F, Fut>(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
     concurrency: usize,
     gate: &Arc<Semaphore>,
+    opts: DownloadOptions,
     download_fn: F,
 ) -> Result<DownloadStats, AppError>
 where
@@ -330,8 +498,6 @@ where
     if total == 0 {
         return Ok(DownloadStats::default());
     }
-    // `total > 0` is checked above, so there is a first task.
-    let timeframe = tasks.first().expect("total > 0").timeframe;
     tracing::debug!(total, concurrency, "downloading files");
 
     let mut stats = DownloadStats {
@@ -339,37 +505,28 @@ where
         ..DownloadStats::default()
     };
     let mut reasons: Vec<String> = Vec::with_capacity(MAX_REPORTED_FAILURES);
-    let mut missing_buckets: Vec<String> = Vec::new();
+    let mut missing_buckets: Vec<MissingBucket> = Vec::new();
     let breaker = Breaker::new();
 
     let mut tasks = tasks.into_iter();
 
     // — probe —
+    // `total > 0` is checked above, so there is a first task.
     let probe = tasks.next().expect("total > 0");
-    match run_one_task(client, gate, &breaker, &download_fn, probe).await {
-        TaskOutcome::Ok => stats.ok += 1,
-        TaskOutcome::NotFound { bucket } => {
-            stats.not_found += 1;
-            missing_buckets.push(bucket);
-        }
-        TaskOutcome::Failed(err) => {
-            stats.failed += 1;
-            if reasons.len() < MAX_REPORTED_FAILURES {
-                reasons.push(err.chain());
-            }
-            if is_transport_failure(&err) {
-                // The endpoint could not be reached at all. Every remaining
-                // file of this pair would spend the whole retry budget to
-                // reach the same verdict, so stop here.
-                breaker.trip();
-                tracing::warn!(
-                    failed = stats.failed,
-                    total = stats.total,
-                    "probe could not reach the endpoint; remaining files were not attempted",
-                );
-            }
-        }
-        TaskOutcome::Skipped => unreachable!("the breaker is closed before the probe runs"),
+    let outcome = run_one_task(client, gate, &breaker, &download_fn, probe).await;
+    let endpoint_unreachable =
+        matches!(&outcome, TaskOutcome::Failed(err) if is_transport_failure(err));
+    record_outcome(outcome, &mut stats, &mut reasons, &mut missing_buckets);
+    if endpoint_unreachable {
+        // The endpoint could not be reached at all. Every remaining
+        // file of this pair would spend the whole retry budget to
+        // reach the same verdict, so stop here.
+        breaker.trip();
+        tracing::warn!(
+            failed = stats.failed,
+            total = stats.total,
+            "probe could not reach the endpoint; remaining files were not attempted",
+        );
     }
 
     // — release the rest —
@@ -386,22 +543,7 @@ where
         })
         .buffer_unordered(concurrency);
     while let Some(outcome) = stream.next().await {
-        match outcome {
-            TaskOutcome::Ok => stats.ok += 1,
-            TaskOutcome::NotFound { bucket } => {
-                stats.not_found += 1;
-                missing_buckets.push(bucket);
-            }
-            TaskOutcome::Failed(err) => {
-                stats.failed += 1;
-                if reasons.len() < MAX_REPORTED_FAILURES {
-                    reasons.push(err.chain());
-                } else {
-                    tracing::debug!(error = %err.chain(), "download failed (detail not retained)");
-                }
-            }
-            TaskOutcome::Skipped => stats.skipped += 1,
-        }
+        record_outcome(outcome, &mut stats, &mut reasons, &mut missing_buckets);
 
         if stats.done() % PROGRESS_EVERY == 0 {
             tracing::info!(
@@ -416,6 +558,49 @@ where
         }
     }
 
+    finalize_batch(stats, reasons, &missing_buckets, opts)
+}
+
+/// Fold one task outcome into the batch accumulators.
+///
+/// Keeping this in one place is what makes the probe and the streamed
+/// files count identically: the two used to duplicate the same four-arm
+/// match, and a new counter only ever reached one of them.
+fn record_outcome(
+    outcome: TaskOutcome,
+    stats: &mut DownloadStats,
+    reasons: &mut Vec<String>,
+    missing_buckets: &mut Vec<MissingBucket>,
+) {
+    match outcome {
+        TaskOutcome::Ok => stats.ok += 1,
+        TaskOutcome::NotFound { bucket } => {
+            stats.not_found += 1;
+            missing_buckets.push(bucket);
+        }
+        TaskOutcome::Failed(err) => {
+            stats.failed += 1;
+            if reasons.len() < MAX_REPORTED_FAILURES {
+                reasons.push(err.chain());
+            } else {
+                tracing::debug!(error = %err.chain(), "download failed (detail not retained)");
+            }
+        }
+        TaskOutcome::Skipped => stats.skipped += 1,
+    }
+}
+
+/// Turn the accumulated batch state into the final verdict.
+///
+/// The two "the requested range is not in the feed" checks live here:
+/// they need the complete batch, not a single file, and they are the only
+/// reason a batch that downloaded *something* can still fail.
+fn finalize_batch(
+    stats: DownloadStats,
+    reasons: Vec<String>,
+    missing_buckets: &[MissingBucket],
+    opts: DownloadOptions,
+) -> Result<DownloadStats, AppError> {
     if stats.not_found > 0 {
         tracing::debug!(
             not_found = stats.not_found,
@@ -428,7 +613,7 @@ where
             skipped = stats.skipped,
             failed = stats.failed,
             window = BREAKER_WINDOW,
-            fail_ratio = BREAKER_FAIL_RATIO,
+            fail_ratio = format!("{BREAKER_FAIL_NUM}/{}", BREAKER_FAIL_DEN),
             "circuit breaker opened; remaining files for this pair were not attempted",
         );
     }
@@ -453,21 +638,42 @@ where
     // the requested range reaches beyond what the feed has published — and
     // reporting success would be actively misleading, because the run
     // downloaded nothing while exiting with a success status.
-    let longest_run = longest_missing_run(&mut missing_buckets, timeframe);
+    let longest_run = longest_missing_run(missing_buckets);
     if stats.total >= MIN_SAMPLES_FOR_NOT_FOUND_RATIO {
-        let ratio = stats.not_found as f64 / stats.total as f64;
-        if ratio > NOT_FOUND_FAIL_RATIO {
-            return Err(AppError::RangeUnavailable {
-                not_found: stats.not_found,
-                total: stats.total,
-                longest_run,
-            });
+        let ratio = cmp_ratio(
+            stats.not_found,
+            stats.total,
+            NOT_FOUND_FAIL_NUM,
+            NOT_FOUND_FAIL_DEN,
+        );
+        if ratio == std::cmp::Ordering::Greater {
+            if opts.allow_missing {
+                tracing::warn!(
+                    not_found = stats.not_found,
+                    total = stats.total,
+                    longest_run,
+                    "a large part of the requested range is missing from the data feed; \
+                     continuing because missing data was allowed",
+                );
+            } else {
+                return Err(AppError::RangeUnavailable {
+                    not_found: stats.not_found,
+                    total: stats.total,
+                    longest_run,
+                });
+            }
         }
-        if ratio > NOT_FOUND_WARN_RATIO {
+        let ratio = cmp_ratio(
+            stats.not_found,
+            stats.total,
+            NOT_FOUND_WARN_NUM,
+            NOT_FOUND_WARN_DEN,
+        );
+        if ratio == std::cmp::Ordering::Greater {
             tracing::warn!(
                 not_found = stats.not_found,
                 total = stats.total,
-                ratio = %ratio,
+                ratio = %format!("{}/{}", stats.not_found, stats.total),
                 "a noticeable share of the requested range is missing from the data feed",
             );
         }
@@ -476,11 +682,21 @@ where
     // problem even when the overall ratio is modest: the feed does not have
     // that stretch of the range at all.
     if longest_run >= MISSING_RUN_FAIL_LEN {
-        return Err(AppError::RangeUnavailable {
-            not_found: stats.not_found,
-            total: stats.total,
-            longest_run,
-        });
+        if opts.allow_missing {
+            tracing::warn!(
+                not_found = stats.not_found,
+                total = stats.total,
+                longest_run,
+                "a long stretch of the requested range is missing from the data feed; \
+                 continuing because missing data was allowed",
+            );
+        } else {
+            return Err(AppError::RangeUnavailable {
+                not_found: stats.not_found,
+                total: stats.total,
+                longest_run,
+            });
+        }
     }
     if stats.ok == 0 && stats.not_found == stats.total {
         tracing::warn!(
@@ -528,6 +744,18 @@ where
                 // A file the server does not have says nothing about whether
                 // the pair is reachable, so it must not count as a failure.
                 breaker.record(true);
+                if bucket_position(&bucket.key, bucket.timeframe).is_none() {
+                    // The destination does not mirror the server layout, so
+                    // the missing-range analysis cannot place this file on
+                    // the calendar. Say so instead of quietly mis-measuring
+                    // the gap.
+                    tracing::warn!(
+                        bucket = %bucket.key,
+                        timeframe = ?bucket.timeframe,
+                        "the missing file's destination does not mirror the server layout; \
+                         the missing-range analysis cannot place it on the calendar",
+                    );
+                }
                 TaskOutcome::NotFound { bucket }
             }
             Err(err) => {
@@ -575,7 +803,7 @@ mod tests {
         let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
         (0..n)
             .map(|i| {
-                let day = start + chrono::Duration::days(i as i64);
+                let day = start + chrono::Duration::days(i64::try_from(i).expect("n fits in i64"));
                 task_for(
                     Timeframe::M1,
                     &format!(
@@ -645,6 +873,32 @@ mod tests {
     }
 
     // — counting —
+
+    /// The four counters are mutually exclusive and add up to the total.
+    #[test]
+    fn the_counters_add_up_to_the_total() {
+        let stats = DownloadStats {
+            total: 10,
+            ok: 4,
+            not_found: 3,
+            failed: 2,
+            skipped: 1,
+        };
+        assert_eq!(stats.done(), stats.total);
+    }
+
+    /// The breaker is considered open exactly when files were skipped.
+    #[test]
+    fn the_circuit_is_open_only_when_files_were_skipped() {
+        let mut stats = DownloadStats {
+            total: 3,
+            ok: 3,
+            ..DownloadStats::default()
+        };
+        assert!(!stats.circuit_open());
+        stats.skipped = 1;
+        assert!(stats.circuit_open());
+    }
 
     #[tokio::test]
     async fn empty_tasks_return_zeroed_stats() {
@@ -753,6 +1007,23 @@ mod tests {
     }
 
     // — failure reporting —
+
+    /// A transport failure must keep its cause.
+    ///
+    /// `Display` alone says "http error: …" and never *why*; the cause
+    /// only exists in the `source()` chain, so a summary built from
+    /// `Display` would be useless for diagnosis.
+    #[tokio::test]
+    async fn a_transport_failure_keeps_its_cause() {
+        let err = transport_error().await;
+        let plain = err.to_string();
+        let chain = err.chain();
+        assert!(chain.starts_with("http error: "), "{chain}");
+        assert!(
+            chain.len() > plain.len(),
+            "the cause must be appended: {chain} vs {plain}"
+        );
+    }
 
     #[tokio::test]
     async fn single_failure_reports_ratio_and_reason() {
@@ -1096,6 +1367,16 @@ mod tests {
 
     // — missing-range detection —
 
+    /// Build a missing-bucket list for one timeframe.
+    fn missing(timeframe: Timeframe, keys: &[&str]) -> Vec<MissingBucket> {
+        keys.iter()
+            .map(|k| MissingBucket {
+                timeframe,
+                key: (*k).to_string(),
+            })
+            .collect()
+    }
+
     /// The bucket key names the calendar slot the file belongs to.
     #[test]
     fn the_bucket_key_uses_the_calendar_components() {
@@ -1104,56 +1385,212 @@ mod tests {
             "/out/dukascopy/EURUSD/2025/BID_candles_day_1.bi5",
             "a",
         );
-        assert_eq!(bucket_key(&d1), "2025");
+        assert_eq!(bucket_key(&d1).key, "2025");
 
         let h1 = task_for(
             Timeframe::H1,
             "/out/dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5",
             "a",
         );
-        assert_eq!(bucket_key(&h1), "2025/06");
+        assert_eq!(bucket_key(&h1).key, "2025/06");
 
         let m1 = task_for(
             Timeframe::M1,
             "/out/dukascopy/EURUSD/2025/06/15/BID_candles_min_1.bi5",
             "a",
         );
-        assert_eq!(bucket_key(&m1), "2025/06/15");
+        assert_eq!(bucket_key(&m1).key, "2025/06/15");
+    }
+
+    /// The key carries the timeframe it was derived for: the same
+    /// destination yields a different key depth per granularity.
+    #[test]
+    fn the_bucket_key_records_its_timeframe() {
+        let task = task_for(
+            Timeframe::H1,
+            "/out/dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5",
+            "a",
+        );
+        assert_eq!(bucket_key(&task).timeframe, Timeframe::H1);
+    }
+
+    /// A destination without any directory component must not panic: the
+    /// key degenerates to an empty string, which simply never matches a
+    /// calendar slot.
+    #[test]
+    fn a_destination_without_directories_yields_an_empty_key() {
+        let task = task_for(Timeframe::D1, "BID_candles_day_1.bi5", "a");
+        assert_eq!(bucket_key(&task).key, "");
+        assert_eq!(bucket_position("", Timeframe::D1), None);
+    }
+
+    /// A key that is not a date cannot be placed on the calendar, so it
+    /// never counts as adjacent to anything.
+    #[test]
+    fn a_non_numeric_key_has_no_calendar_position() {
+        assert_eq!(bucket_position("not-a-year", Timeframe::D1), None);
+        assert_eq!(bucket_position("2025/not-a-month", Timeframe::H1), None);
+        assert_eq!(bucket_position("2025/06/not-a-day", Timeframe::M1), None);
+    }
+
+    /// A day that does not exist cannot be adjacent to its successor.
+    #[test]
+    fn an_impossible_date_is_never_adjacent() {
+        let a = bucket_position("2025/02/30", Timeframe::M1).unwrap();
+        let b = bucket_position("2025/03/01", Timeframe::M1).unwrap();
+        assert!(!is_adjacent_bucket(a, b, Timeframe::M1));
     }
 
     #[test]
     fn consecutive_missing_days_form_one_run() {
-        let mut keys = vec![
-            "2025/06/17".to_string(),
-            "2025/06/15".to_string(),
-            "2025/06/16".to_string(),
-        ];
-        assert_eq!(longest_missing_run(&mut keys, Timeframe::M1), 3);
+        let buckets = missing(Timeframe::M1, &["2025/06/17", "2025/06/15", "2025/06/16"]);
+        assert_eq!(longest_missing_run(&buckets), 3);
     }
 
     /// A served day in between breaks the run.
     #[test]
     fn a_gap_breaks_the_run() {
-        let mut keys = vec!["2025/06/15".to_string(), "2025/06/17".to_string()];
-        assert_eq!(longest_missing_run(&mut keys, Timeframe::M1), 1);
+        let buckets = missing(Timeframe::M1, &["2025/06/15", "2025/06/17"]);
+        assert_eq!(longest_missing_run(&buckets), 1);
     }
 
     #[test]
     fn a_month_end_and_the_next_month_start_are_adjacent() {
-        let mut keys = vec!["2025/06/30".to_string(), "2025/07/01".to_string()];
-        assert_eq!(longest_missing_run(&mut keys, Timeframe::M1), 2);
+        let buckets = missing(Timeframe::M1, &["2025/06/30", "2025/07/01"]);
+        assert_eq!(longest_missing_run(&buckets), 2);
     }
 
     #[test]
     fn month_buckets_run_across_the_year() {
-        let mut keys = vec!["2025/12".to_string(), "2026/01".to_string()];
-        assert_eq!(longest_missing_run(&mut keys, Timeframe::H1), 2);
+        let buckets = missing(Timeframe::H1, &["2025/12", "2026/01"]);
+        assert_eq!(longest_missing_run(&buckets), 2);
     }
 
     #[test]
     fn year_buckets_run_across_the_year() {
-        let mut keys = vec!["2025".to_string(), "2026".to_string()];
-        assert_eq!(longest_missing_run(&mut keys, Timeframe::D1), 2);
+        let buckets = missing(Timeframe::D1, &["2025", "2026"]);
+        assert_eq!(longest_missing_run(&buckets), 2);
+    }
+
+    /// The run is measured *within* each timeframe's own calendar.
+    ///
+    /// A `D1` run of three years and an `M1` run of three days are both
+    /// three buckets long, but they are not comparable: mixing the two key
+    /// spaces would sort `"2025"` next to `"2025/06/15"` and call the pair
+    /// non-adjacent, splitting both runs in two.
+    #[test]
+    fn the_run_is_measured_per_timeframe() {
+        let mut buckets = missing(Timeframe::D1, &["2023", "2024", "2025"]);
+        buckets.extend(missing(
+            Timeframe::M1,
+            &["2025/06/15", "2025/06/16", "2025/06/17"],
+        ));
+        assert_eq!(longest_missing_run(&buckets), 3);
+    }
+
+    /// A batch that mixes timeframes must not report a run that is longer
+    /// than the one actually present in either calendar.
+    #[test]
+    fn mixing_timeframes_does_not_inflate_the_run() {
+        // Two D1 years and one unrelated M1 day: the D1 run is 2, the M1
+        // run is 1 — the answer must be 2, not 3.
+        let mut buckets = missing(Timeframe::D1, &["2024", "2025"]);
+        buckets.extend(missing(Timeframe::M1, &["2025/06/15"]));
+        assert_eq!(longest_missing_run(&buckets), 2);
+    }
+
+    /// No missing bucket at all means no run.
+    #[test]
+    fn an_empty_missing_list_has_no_run() {
+        assert_eq!(longest_missing_run(&[]), 0);
+    }
+
+    /// A key that cannot be placed on the calendar must not truncate a
+    /// real gap.
+    ///
+    /// Such a key comes from a destination that does not mirror the server
+    /// layout. It can neither extend a run nor break one, so the two
+    /// consecutive years around it still count as one run of two.
+    #[test]
+    fn an_unplaceable_key_does_not_break_a_run() {
+        let buckets = missing(Timeframe::D1, &["2024", "not-a-year", "2025"]);
+        assert_eq!(
+            longest_missing_run(&buckets),
+            2,
+            "the garbage key must not cut the run in two"
+        );
+    }
+
+    /// A batch whose keys are *all* unplaceable has no measurable gap.
+    #[test]
+    fn a_batch_of_only_unplaceable_keys_has_no_run() {
+        let buckets = missing(Timeframe::D1, &["nope", "also-nope"]);
+        assert_eq!(longest_missing_run(&buckets), 0);
+    }
+
+    // — exact ratio arithmetic —
+
+    /// The ratio comparison is exact: "exactly 5%" must not warn.
+    #[test]
+    fn the_warn_ratio_boundary_is_exact() {
+        assert_eq!(
+            cmp_ratio(1, 20, NOT_FOUND_WARN_NUM, NOT_FOUND_WARN_DEN),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            cmp_ratio(21, 400, NOT_FOUND_WARN_NUM, NOT_FOUND_WARN_DEN),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            cmp_ratio(19, 400, NOT_FOUND_WARN_NUM, NOT_FOUND_WARN_DEN),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    /// "Exactly 50%" must not fail the batch.
+    #[test]
+    fn the_fail_ratio_boundary_is_exact() {
+        assert_eq!(
+            cmp_ratio(1, 2, NOT_FOUND_FAIL_NUM, NOT_FOUND_FAIL_DEN),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            cmp_ratio(3, 5, NOT_FOUND_FAIL_NUM, NOT_FOUND_FAIL_DEN),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    /// Half of the window failing is exactly the trip point.
+    ///
+    /// The threshold is "at least half", so the breaker opens on the
+    /// attempt that completes the window with 16 failures out of 32 — not
+    /// one attempt earlier.
+    #[test]
+    fn the_breaker_trips_at_exactly_half_the_window() {
+        let breaker = Breaker::new();
+        let half = BREAKER_WINDOW / 2;
+        for _ in 0..half {
+            assert!(
+                !breaker.record(true),
+                "a success must never trip the breaker"
+            );
+        }
+        for i in 0..half {
+            let last = i + 1 == half;
+            let open = breaker.record(false);
+            if last {
+                assert!(
+                    open,
+                    "the breaker must trip once the window holds exactly half failures"
+                );
+            } else {
+                assert!(
+                    !open,
+                    "the breaker must stay shut while the window is still filling"
+                );
+            }
+        }
+        assert!(breaker.is_open());
     }
 
     /// A long stretch of consecutive missing buckets points outside the
@@ -1272,6 +1709,81 @@ mod tests {
         let stats = ok_with(|_: reqwest::Client, _: DownloadTask| async { Ok(()) }).await;
         assert_eq!(stats.ok, 1);
         assert_eq!(stats.total, 1);
+    }
+
+    // — the "allow missing" opt-out —
+
+    /// A range the feed does not have fails the batch by default.
+    #[tokio::test]
+    async fn an_unavailable_range_fails_by_default() {
+        let err = run_downloads_inner_with(
+            &client(),
+            daily_tasks(20),
+            16,
+            &gate(16),
+            DownloadOptions::default(),
+            |_: reqwest::Client, t: DownloadTask| async move {
+                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                if i < 10 {
+                    Err(AppError::NotFound { url: t.url })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::RangeUnavailable { .. }), "{err:?}");
+    }
+
+    /// With `allow_missing` the same batch succeeds and still reports the
+    /// 404s — the opt-out relaxes the *verdict*, not the bookkeeping.
+    #[tokio::test]
+    async fn allow_missing_turns_the_unavailable_range_into_a_warning() {
+        let stats = run_downloads_inner_with(
+            &client(),
+            daily_tasks(20),
+            16,
+            &gate(16),
+            DownloadOptions {
+                allow_missing: true,
+            },
+            |_: reqwest::Client, t: DownloadTask| async move {
+                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                if i < 10 {
+                    Err(AppError::NotFound { url: t.url })
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("the range check is relaxed, the batch must succeed");
+
+        assert_eq!(stats.not_found, 10);
+        assert_eq!(stats.ok, 10);
+        assert_eq!(stats.failed, 0);
+    }
+
+    /// The opt-out covers the *range* checks only. A file that actually
+    /// failed to download still fails the batch.
+    #[tokio::test]
+    async fn allow_missing_does_not_hide_a_real_download_failure() {
+        let err = run_downloads_inner_with(
+            &client(),
+            daily_tasks(20),
+            16,
+            &gate(16),
+            DownloadOptions {
+                allow_missing: true,
+            },
+            |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::BatchFailed { .. }), "{err:?}");
     }
 
     // — global gate —

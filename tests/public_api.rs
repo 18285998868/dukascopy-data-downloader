@@ -163,3 +163,64 @@ async fn an_empty_batch_succeeds_with_zeroed_statistics() {
     assert_eq!(stats.failed, 0);
     assert_eq!(stats.skipped, 0);
 }
+
+/// A batch may mix timeframes, and the missing-range analysis must then
+/// measure the longest run of consecutive missing buckets **within each
+/// timeframe's own calendar**.
+///
+/// A `D1` gap is counted in years and an `M1` gap in days. Sorting both
+/// key spaces into one list would interleave them and split the year-long
+/// run into pieces — the five missing years below would never reach the
+/// "five consecutive missing buckets" threshold, and a range that is
+/// plainly outside the feed's coverage would be reported as a success.
+#[tokio::test]
+async fn a_mixed_timeframe_batch_is_analysed_per_timeframe() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut tasks: Vec<ddd::config::DownloadTask> = Vec::new();
+    for year in 2021..=2025 {
+        tasks.push(ddd::config::DownloadTask {
+            url: format!("{}/d1-{year}.bi5", server.uri()),
+            dest: dir
+                .path()
+                .join(format!("dukascopy/EURUSD/{year}/BID_candles_day_1.bi5")),
+            symbol: ddd::Symbol::new("EURUSD").unwrap(),
+            timeframe: ddd::Timeframe::D1,
+        });
+    }
+    // An M1 bucket that sorts *between* two of the years.
+    tasks.push(ddd::config::DownloadTask {
+        url: format!("{}/m1.bi5", server.uri()),
+        dest: dir
+            .path()
+            .join("dukascopy/EURUSD/2023/06/15/BID_candles_min_1.bi5"),
+        symbol: ddd::Symbol::new("EURUSD").unwrap(),
+        timeframe: ddd::Timeframe::M1,
+    });
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(4));
+    let err = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, 4, &gate)
+        .await
+        .unwrap_err();
+
+    match err {
+        ddd::AppError::RangeUnavailable {
+            not_found,
+            total,
+            longest_run,
+        } => {
+            assert_eq!(not_found, 6);
+            assert_eq!(total, 6);
+            assert_eq!(
+                longest_run, 5,
+                "the five missing years must be measured as one run of five"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}

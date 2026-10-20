@@ -44,6 +44,36 @@ cargo run --release -- -c config.toml
 RUST_LOG=debug cargo run --release -- -c config.toml
 ```
 
+### 命令行参数
+
+| 参数 | 说明 |
+|---|---|
+| `-c, --config <PATH>` | TOML 配置文件路径（**必填**） |
+| `--allow-missing` | 豁免"请求区间不在 feed 里"的两条判据（404 占比 / 连续缺失段）：不再因此非零退出，只打 `warn`。文件**真的下载失败**仍然让 run 失败。详见"错误处理" |
+
+```
+Download raw Dukascopy historical kline (.bi5) files from the public Datafeed
+
+Usage: dukascopy-data-downloader [OPTIONS] --config <CONFIG>
+
+Options:
+  -c, --config <CONFIG>
+          Path to the TOML configuration file
+
+      --allow-missing
+          Tolerate a requested range that the data feed does not have.
+
+          Without this flag the run fails when the feed is missing the requested range
+          (too many 404s, or a long stretch of consecutive missing files). With it, the
+          run finishes successfully with whatever the feed did have. Files that actually
+          failed to download still fail the run.
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+按 Ctrl+C 可以安全中断：程序取消 run、释放运行锁，并以非零状态退出（一次被中断的 run 并没有交付请求的区间）。
+
 ## 配置
 
 完整字段说明见 `config.example.toml`，冒烟配置见 `config.test.toml`。
@@ -62,7 +92,7 @@ RUST_LOG=debug cargo run --release -- -c config.toml
 
 - **未知键拒收**（`deny_unknown_fields`），拼错即报错，错误信息带配置文件路径。
 - `symbol` / `timeframe` 不能为空。
-- `symbol` 必须匹配 `[A-Z0-9]{3,20}` —— 它会被原样插入 URL 路径与本地目录路径，放宽会引入路径穿越与 URL 查询/片段注入。
+- `symbol` 必须匹配 `[A-Z0-9]{3,20}` —— 它会被原样插入 URL 路径与本地目录路径，放宽会引入路径穿越与 URL 查询/片段注入。长度按**字符**计（不是字节）：`"欧元"` 是 2 个字符 6 字节，按字节算会从"字符数"这条规则里漏过去。
 - `concurrency` 必须 `1..=256`。
 - `start` 与 `end` 同时出现时，`start > end` 报错。
 - 列表自动 `sort + dedup`。
@@ -80,6 +110,8 @@ end   = min(config.end, 昨天)
 > 这一步刻意在**解析完默认值之后**再做上限校验。如果只校验"用户显式写了 start 和 end"的情况，省略 `end`（它是可选项！）就能开出无上限区间——例如 `start = "1900-01-01"` 会展开出 46000+ 个任务。
 >
 > 天数按**闭区间**计：`start..=end` 覆盖的天数是两个日期间隔 + 1，所以上限 5490 天对应的是"含首尾共 5490 个自然日"。区间校验是纯算术，排在所有 I/O 之前；区间反序（`start > end`）则直接 warn 返回，连磁盘都不扫。
+>
+> 上限以公开常量 `ddd::MAX_RANGE_DAYS`（= 366 × 15）暴露，调用方不必把它抄一遍。
 
 ## 架构
 
@@ -106,32 +138,50 @@ tests/
 ```
 
 > lint 策略统一放在 `Cargo.toml` 的 `[workspace.lints]`：lib、bin、集成测试三者受同一套约束（此前 crate 属性只覆盖声明它的那个 crate，`src/main.rs` 不受约束）。
+>
+> | 组 | 级别 | 作用 |
+> |---|---|---|
+> | `rust::missing_docs` / `missing_debug_implementations` | warn | 公开项必须有文档；公开类型必须能 `Debug` |
+> | `rust::unsafe_code` | warn | 全 crate 零 `unsafe`：运行锁刻意用原子 `create_dir` 而不是 `flock`，正是为了不引入 C 依赖与 `unsafe` |
+> | `clippy::correctness` | **deny** | 明确会出错的写法，直接编译失败 |
+> | `clippy::suspicious` / `style` / `complexity` / `perf` | warn | 常规可疑写法 |
+> | `clippy::pedantic` | warn | 补齐上面几组漏掉的：公开项缺 `#[must_use]`、文档里的标识符没加反引号、浮点转换丢精度、函数长到无法评审 |
+>
+> `clippy::pedantic` 之前没开，开启后它一次抓出了 10 处问题（4 处 `usize → f64` 精度损失、1 处超长函数、1 处 `HashSet` 未泛型化 hasher、2 处文档反引号、1 处多余生命周期、1 处缺 `#[must_use]`）—— 这些都已修掉，现在 `cargo clippy --all-targets --all-features -- -D warnings` 零告警。
+>
+> 占比判定一律用**整数比较**（`part * den` vs `whole * num`），不用浮点除法：阈值是精确分数（1/20 = 5%、1/2 = 50%），浮点只会给一个本不需要舍入的比较加上舍入，并让"恰好 5%"这种边界依赖二进制的表示方式。
 
 ### 执行流程
 
 ```
 main
- └─ app::run(config.toml)
+  └─ app::run(config.toml)
+     ├─ termination_signal       注册 SIGINT / SIGTERM handler（取锁之前！）
      ├─ AppConfig::load            spawn_blocking：读文件 → toml 解析 → 校验
      ├─ acquire_run_lock           output_dir 独占锁（拒绝并发实例）
-     ├─ effective_range            归一起止日期并施加 15 年上限（纯计算，先于任何 I/O）
-     ├─ start > end                → warn 直接返回（不扫盘、不联网）
-     ├─ build_client               spawn_blocking：连接超时 30s / 请求超时 30s / 连接池每主机 256 空闲
-     ├─ scan_local_files           一次全量扫描，得到相对路径集合；同时删除残留 *.bi5.tmp
-     ├─ Semaphore(concurrency)     全局下载闸门，整个 run 共享
-     └─ JoinSet: for symbol × for timeframe 并发 spawn
-          └─ run_pair                tracing span：symbol / timeframe
-              └─ run_one
-                  ├─ start > end        → warn 跳过（不联网）
-                  ├─ 无已闭合桶         → debug 跳过（见"只下载已闭合的桶"）
-                  ├─ build_download_tasks  ① → ②
-                  ├─ 无任务              → debug 跳过（全部命中缓存）
-                  └─ run_downloads      ③
+     └─ select! { run_pipeline(...) | SIGINT / SIGTERM }
+        ├─ effective_range            归一起止日期并施加 15 年上限（纯计算，先于任何 I/O）
+        ├─ start > end                → warn 直接返回（不扫盘、不联网）
+        ├─ build_client               spawn_blocking：连接超时 30s / 请求超时 30s / 连接池每主机 256 空闲
+        ├─ scan_local_files           一次全量扫描，得到相对路径集合；同时删除残留 *.bi5.tmp
+        ├─ Semaphore(concurrency)     全局下载闸门，整个 run 共享
+        └─ JoinSet: for symbol × for timeframe 并发 spawn
+             └─ run_pair                tracing span：symbol / timeframe
+                 └─ run_one
+                     ├─ start > end        → warn 跳过（不联网）
+                     ├─ 无已闭合桶         → debug 跳过（见"只下载已闭合的桶"）
+                     ├─ build_download_tasks  ① → ②
+                     ├─ 无任务              → debug 跳过（全部命中缓存）
+                     └─ run_downloads      ③
 ```
 
 > 阻塞调用（读配置、建客户端、扫盘、取锁）一律走 `spawn_blocking`，不占住 async worker 线程；文件读写用 `tokio::fs`。区间归一与上限校验是纯算术，排在最前 —— 配置写错时代价是零，而不是一次全盘扫描。
 >
-> **运行锁**：`output_dir/.ddd.lock/` 目录即锁。同一 `output_dir` 上并发跑两个实例不安全 —— 后启动的那个会在扫描阶段删掉前一个正在写的 `.bi5.tmp`，让那个文件以 "No such file or directory" 失败。锁用目录实现（创建目录是原子操作），不需要 C 依赖或 `unsafe`；代价是进程崩溃后锁目录会残留，需要手动删除（错误信息里会给出路径）。
+> **信号与锁的时序**：信号 handler 在**取锁之前**注册，取锁在**可取消区间之外**，锁 guard 则**由 pipeline future 持有**。三者合起来保证：中断时 future 被丢弃 → guard `Drop` → 锁目录删除；同时不会出现"中断之后才创建锁、再也没人释放"的窗口。代价是中断的 run 以非零状态退出（`AppError::Interrupted`）。
+>
+> **运行锁**：`output_dir/.ddd.lock/` 目录即锁。同一 `output_dir` 上并发跑两个实例不安全 —— 后启动的那个会在扫描阶段删掉前一个正在写的 `.bi5.tmp`，让那个文件以 "No such file or directory" 失败。锁用目录实现（创建目录是原子操作），不需要 C 依赖或 `unsafe`；代价是进程被 `kill -9` 强杀后锁目录会残留，需要手动删除（错误信息里会给出路径）。
+>
+> **Ctrl+C 会正常释放锁**：程序注册了 `SIGINT` / `SIGTERM` handler，收到信号即取消 run —— pipeline future 被丢弃，锁 guard 随之 `Drop`，锁目录被删除。锁的**获取**刻意放在可取消区间之外：否则会出现"中断之后才创建锁、再也没人释放"的窗口。代价是中断时程序**以非零状态退出**（`AppError::Interrupted`）—— 一次被中断的 run 并没有交付请求的区间，只看退出码的调用方不能把它当成"下载完成"。
 
 ## 关键设计
 
@@ -152,19 +202,21 @@ main
 **代价**：H1 要等月末、D1 要等年末才能拿到当期的完整数据。
 **收益**：不会把半截数据永久缓存。
 
-> ⚠️ **对当前 feed 的实际影响**（实测于 2026-10-20）
+> ⚠️ **对当前 feed 的实际影响**（重新实测于 2026-10-20）
 >
-> Dukascopy 的数据 feed 本身有延迟：实测最新只发布到 **2026-08-30**（约 50 天前）。与"只下已闭合桶"叠加后的结果是：
+> Dukascopy 的数据 feed 本身有延迟：实测最新只发布到 **2026-09-19**（约 31 天前）。与"只下已闭合桶"叠加后的结果是：
 >
 > | 周期 | 实际能拿到的最新数据 | 原因 |
 > |---|---|---|
-> | M1 | 2026-08-30 | feed 边界；日桶当天即定稿，不受闭合规则限制 |
-> | H1 | 2026-08 | 9 月、10 月的月文件尚未发布 → 404 |
+> | M1 | 2026-09-19 | feed 边界；日桶当天即定稿，不受闭合规则限制 |
+> | H1 | 2026-08 | 9 月的月文件尚未发布 → 404（10 月的月文件因"未闭合"根本不会去请求） |
 > | D1 | **2025 年** | 2026 年的年文件在 feed 落后期间从未存在过 → 404 |
 >
 > 即使 feed 恢复正常，**D1 仍要等到 12-31 之后**才能拿到 2026 年的完整年文件 —— 这是"年桶"的固有粒度，不是本程序能绕开的。
 >
 > 这些缺失**不会**被当作成功：程序会因为 404 占比或连续缺失段超阈值而以非零状态退出（见"错误处理"），你不会在毫不知情的情况下拿到一份"看起来完整、实际缺一大段"的数据。
+>
+> 例：请求 `M1 / 2026-08-25 .. 2026-10-19`，实测下到 25 个文件、31 个 404，最长连续缺失段 30 天 → 以 `RangeUnavailable` 非零退出。
 
 ### 全局并发闸门
 
@@ -196,12 +248,12 @@ main
 
 ```
 GET → 校验状态码 → 建父目录 → 删残留 .bi5.tmp
-    → 流式写 .bi5.tmp → flush → sync_all → rename → .bi5
+    → 流式写 .bi5.tmp → sync_all → rename → .bi5
     → fsync 父目录
 ```
 
 - 写入期间只存在 `.bi5.tmp`，最终文件名下永远不会出现半截文件。
-- `sync_all()` 而非仅 `flush()`：只 `flush` 只能把数据交给内核，断电后仍可能留下一个"已 rename 但为空"的 `.bi5`，而缓存扫描只看文件名不看大小，会把它永久当成完整数据 —— 该文件从此再也不重下。
+- `sync_all()` 而非仅 `flush()`：只 `flush` 只能把数据交给内核，断电后仍可能留下一个"已 rename 但为空"的 `.bi5`，而缓存扫描只看文件名不看大小，会把它永久当成完整数据 —— 该文件从此再也不重下。（`File::flush` 本身是空操作，保留它只会白白多走一趟 blocking pool，所以直接省掉。）
 - `rename` 之后额外 `fsync` 父目录：文件本体的 `sync_all` 只保证**内容**持久，rename 创建的**目录项**仍在 page cache 里，不刷目录的话断电可能撤销这次 rename，载荷退回 `.bi5.tmp` 甚至消失。目录 fsync 失败（个别文件系统不支持）时忽略，不因此判定下载失败。
 - 每次重试前先删除残留 `.bi5.tmp`，避免 `File::create` 在旧内容后追加。
 
@@ -289,7 +341,8 @@ https://datafeed.dukascopy.com/datafeed/...   200 | 429    ← 行情数据始�
 | `NotFound` | HTTP 404 —— 该文件不存在 |
 | `BatchFailed` | 单个 pair 批次内有文件失败，携带精确计数 + 有上限的原因样本 |
 | `PairsFailed` | 整个 run 有 pair 失败，携带精确计数 + 有上限的原因样本 |
-| `RangeUnavailable` | 请求区间不存在（404 占比过高，或存在长段连续缺失），很可能是超出了 feed 的覆盖范围 |
+| `RangeUnavailable` | 请求区间不存在（404 占比过高，或存在长段连续缺失），很可能是超出了 feed 的覆盖范围（`--allow-missing` 可豁免） |
+| `Interrupted` | run 被 `SIGINT`（Ctrl+C）/ `SIGTERM` 取消 —— 锁已释放，区间未交付，程序非零退出 |
 | `Join` | tokio 任务 join 错误 |
 
 两级失败分开表达，不混用一个变体：`BatchFailed`（pair 内的**文件**级）与 `PairsFailed`（run 内的 **pair** 级）各自计数，"failed" 指代哪一单位一目了然。
@@ -302,20 +355,36 @@ https://datafeed.dukascopy.com/datafeed/...   200 | 429    ← 行情数据始�
 | > 5% | `warn` 提示区间可能超出覆盖范围 |
 | > 50%（且样本 ≥ 8） | 判定失败，返回 `RangeUnavailable`，**run 以非零状态退出** |
 
+占比用整数交叉相乘比较（`not_found × 20` vs `total × 1`），不用浮点除法 —— 阈值是精确分数，"恰好 5%"必须落在"不告警"这一侧，且不受二进制表示影响。
+
 最后一条尤其重要：此前这类运行会**成功退出却一个文件都没下**，用户以为数据已完整下载。
 
 **连续缺失段检测**（与占比判据独立）：把缺失的文件按**桶**（M1 一天 / H1 一月 / D1 一年）归位、排序，找出**日历上连续**的最长缺失段。连续 ≥ **5** 个桶缺失即判定失败 —— 这条不看占比，所以"整段缺失、其余正常"（占比可能只有 10~20%）也能被抓住。阈值定在 5 是因为一个长周末加一个法定假日最多连续 3 天。
+
+> 缺失段**按周期分组计算**：`D1` 的桶键是年份（`2025`），`M1` 的桶键是完整日期（`2025/06/15`），两套键空间不可比。混在一个列表里排序会让 `2023` 与 `2023/06/15` 挨在一起，把连续的年份缺失段切成几截 —— 明明"连续缺 5 年"却因最长段只有 3 而判定通过。因此先按周期分组，组内各自算最长段，最后取各组最大值。
+>
+> 公开 API `run_downloads` 允许一个批次里混合周期，分组逻辑正是为此存在（`tests/public_api.rs` 有对应回归测试）。
 
 两种判据都通过 `RangeUnavailable` 报错，消息里带上最长连续缺失段的长度。
 
 > ⚠️ **对工作流的影响**
 >
-> 这条改动把"数据源落后"从**静默**变成了**显式失败**：任何跨越 feed 落后区间的 run 都会**以非零状态退出** —— 即使它已经成功下载了区间内能拿到的全部文件。
+> 默认（严格）行为把"数据源落后"变成**显式失败**：任何跨越 feed 落后区间的 run 都会**以非零状态退出** —— 即使它已经成功下载了区间内能拿到的全部文件。
 >
-> - 工作流若是"**跑一次、拿到能拿到的、其余忽略**"（例如在 feed 落后期间做增量维护），**当前行为不符合预期**，需要一个类似 `--allow-missing` 的开关来豁免这两条判据。
-> - 工作流若是"**要么完整、要么报错**"（CI、定时全量同步），当前行为正合需要。
+> - 工作流若是"**要么完整、要么报错**"（CI、定时全量同步），默认行为正合需要。
+> - 工作流若是"**跑一次、拿到能拿到的、其余忽略**"（例如在 feed 落后期间做增量维护），加 **`--allow-missing`** 即可豁免这两条判据。
 >
-> 目前**没有**这个开关，尚未实现。
+> ```
+> # 严格模式：区间超出 feed 覆盖范围 → 以 RangeUnavailable 非零退出
+> dukascopy-data-downloader -c config.toml
+>
+> # 尽力而为：同样的区间 → 只打 warn，退出码 0
+> dukascopy-data-downloader -c config.toml --allow-missing
+> ```
+>
+> `--allow-missing` **只豁免"区间不在 feed 里"这两条判据**。文件**真的下载失败**（连接错误、超时、5xx 耗尽重试预算）仍然会让 run 失败 —— 那是"下载坏了"，不是"feed 没有这段区间"。实测：feed 限流返回 503 时，带不带这个开关都会非零退出。
+>
+> 豁免时程序会打三条 `warn` 说清楚发生了什么，不会静默吞掉：可下载的占比、最长连续缺失段、以及"全部文件都没找到"。
 
 日志与汇总一律使用 `AppError::chain()`，它会沿 `Error::source()` 展开完整因果链。仅用 `Display` 会丢掉根因（表现为只剩 `http error: ...`，看不到底层的 `operation timed out`）。
 
@@ -326,26 +395,32 @@ https://datafeed.dukascopy.com/datafeed/...   200 | 429    ← 行情数据始�
 ## 测试
 
 ```bash
-cargo test              # 169 个单元测试 + 12 个集成测试 + 12 个 doctest
+cargo test              # 206 个单元测试 + 13 个集成测试 + 13 个 doctest
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
+cargo doc --no-deps     # 公开 API 文档（无断链）
+
+# 冒烟：真实下载 1 个品种 × D1 × 2025 年，输出到 /tmp
+cargo run --release -- -c config.test.toml
 ```
 
 单元测试（`src/` 内 `#[cfg(test)]` 模块）覆盖范围：
 
-- `config` —— 解析、别名归一、符号字符集/长度、区间归一与上限（含闭区间天数边界）、15 年封顶回归
+- `config` —— 解析、别名归一、符号字符集/长度（含**多字节字符按字符数计**）、区间归一与上限（含闭区间天数边界）、15 年封顶回归
 - `build_urls` —— 年/月/日三种分桶、跨月跨年、惰性（`take(3)` 不展开全量）、rel_path 与 URL 严格镜像、**已闭合桶边界**
 - `build_download_tasks` —— 缓存剔除、price_type 参与缓存键、URL 与目标路径一致性
-- `download` —— 计数口径、**探针先行**（传输失败即放弃整对）、**滑动窗口失败率**（50% 交错失败也能熔断）、低失败率不熔断、原因上限、**404 连续缺失段检测**、**跨 pair 的全局闸门**（并发 4 个 pair 峰值仍为 3）
+- `download` —— 计数口径（四个计数器互斥且合计等于 total）、**探针先行**（传输失败即放弃整对）、**滑动窗口失败率**（50% 交错失败也能熔断、恰好半窗口即熔断）、低失败率不熔断、原因上限、**404 连续缺失段检测**（**按周期分组**、**无法定位的键不打断真实缺口**）、**占比比较的整数精确性**、**`--allow-missing` 只豁免区间判据**（真实下载失败仍然失败）、**跨 pair 的全局闸门**（并发 4 个 pair 峰值仍为 3）
 - `download::stream` —— 状态码分类、`Retry-After` 解析、wiremock 端到端（成功/覆盖/404 不重试/5xx 重试恢复/大文件/空体）、**预算不被 `Retry-After` 绕过**、IO 失败带路径
-- `scan_local_files` —— 嵌套扫描、扩展名过滤、`.bi5.tmp` 清理、**不误删无关 `.tmp`**、缓存键分隔符归一
-- `run_lock` —— 锁的获取/释放、第二个实例被拒
-- `error` —— 错误链展开、两级失败变体不混淆、空原因列表不留悬空分隔符
+- `scan_local_files` —— 嵌套扫描、扩展名过滤、`.bi5.tmp` 清理、**不误删无关 `.tmp`**、缓存键分隔符归一、**运行锁目录不计入缓存**
+- `run_lock` —— 锁的获取/释放、第二个实例被拒、**拒绝信息给出待删目录**、输出目录按需创建、**中止持有者会释放锁**（中断路径的关键不变量）
+- `backoff` —— 预算耗尽即停、间隔不超预算、`reset` 重置间隔增长
+- `error` —— 错误链展开、两级失败变体不混淆、空原因列表不留悬空分隔符、**传输错误保留根因**、**中断错误点名信号**
+- `cli` —— 参数解析、**帮助文本包含 `--config` 与 `--allow-missing`**、opt-out 默认关闭
 - `app` —— panic payload 恢复、**未闭合桶导致整对跳过**
 
 集成测试（`tests/`）从**外部使用者视角**验证公开契约，只能用 `pub` API：
 
-- `public_api.rs` —— 配置加载契约、URL/目标路径/任务元数据三者同步、缓存键一致性（含 price_type）、错误链
+- `public_api.rs` —— 配置加载契约、URL/目标路径/任务元数据三者同步、缓存键一致性（含 price_type）、错误链、**混合周期批次按周期分别分析缺失段**
 - `download_flow.rs` —— wiremock 端到端：落盘内容正确、scratch 文件被 rename 掉、404 不留痕、批次里 404 与成功混排
 
 > 集成测试**不覆盖 5xx 重试路径**：公开的 `download_to_file` 用的是生产退避预算（120s），会让测试挂住。5xx 由单元测试覆盖 —— 那里可以注入退避策略。
@@ -355,7 +430,7 @@ cargo fmt --all -- --check
 - 只支持 D1 / H1 / M1，不支持 Dukascopy 的 tick 与其他周期。
 - 不校验 `.bi5` 内容完整性（不做 LZMA 解码校验），按原始字节镜像保存。
 - **只下载已闭合的桶**（见"只下载已闭合的桶"）：H1 要等月末、D1 要等年末才能拿到当期完整数据；feed 落后期间 D1 实际只能拿到**上一年**。
-- **数据 feed 有延迟**：实测（2026-10-20）最新只发布到 2026-08-30，更早的区间一律 404。
-- **跨越 feed 落后区间的 run 会非零退出**：404 占比或连续缺失段超阈值即判定失败，即使区间内可下载的文件都已下完（见"错误处理"）。若需要"尽力而为"语义，**目前没有** `--allow-missing` 之类的开关。
+- **数据 feed 有延迟**：实测（2026-10-20）最新只发布到 2026-09-19，更早的区间一律 404。
+- **跨越 feed 落后区间的 run 会非零退出**：404 占比或连续缺失段超阈值即判定失败，即使区间内可下载的文件都已下完（见"错误处理"）。需要"尽力而为"语义时加 **`--allow-missing`**。
 - **无断点续传**：中断后重跑依赖 `.bi5.tmp` 清理 + 整体重下该文件。
-- **运行锁不是内核级的**：进程被 kill -9 后 `output_dir/.ddd.lock/` 会残留，需要手动删除（错误信息里会给出路径）。
+- **运行锁不是内核级的**：进程被 `kill -9` 强杀后 `output_dir/.ddd.lock/` 会残留，需要手动删除（错误信息里会给出路径）。**Ctrl+C / SIGTERM 不会留下残留** —— 信号会取消 run 并触发锁的 `Drop` 释放。锁的 `Drop` 释放失败时现在会打 `warn` 日志提示手动删除 —— 否则下一次 run 拒绝启动时看起来像是"有进程卡住了"，而不是"上次留下了空目录"。

@@ -40,7 +40,7 @@ use crate::config::{PriceType, Symbol, Timeframe};
 /// failing with HTTP 404, reverting this constant to the `www` entry host is
 /// the fix.
 pub(crate) const FEED_BASE: &str = "https://datafeed.dukascopy.com/datafeed";
-/// Local storage root below output_dir (our choice, mirrors server path).
+/// Local storage root below `output_dir` (our choice, mirrors server path).
 const LOCAL_PREFIX: &str = "dukascopy";
 
 /// A download URL paired with the local path that mirrors it.
@@ -245,13 +245,13 @@ pub(crate) fn last_closed_day(tf: Timeframe, end: NaiveDate, today: NaiveDate) -
 ///     "dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5"
 /// );
 /// ```
-pub fn build_urls<'a>(
-    symbol: &'a Symbol,
+pub fn build_urls(
+    symbol: &Symbol,
     price_type: PriceType,
     tf: Timeframe,
     date_start: NaiveDate,
     date_end: NaiveDate,
-) -> impl Iterator<Item = DownloadUrl> + 'a {
+) -> impl Iterator<Item = DownloadUrl> + '_ {
     let period = tf_period(tf);
     bucket_dates(date_start, date_end, period).map(move |date| {
         let path = server_path(symbol, price_type, tf, date, period);

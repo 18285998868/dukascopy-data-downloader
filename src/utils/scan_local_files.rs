@@ -217,4 +217,32 @@ mod tests {
         assert_eq!(key, "dukascopy/EURUSD/2025/BID_candles_day_1.bi5");
         assert!(!key.contains(std::path::MAIN_SEPARATOR) || std::path::MAIN_SEPARATOR == '/');
     }
+
+    /// A nested path keeps every component — the key has to mirror the
+    /// server path exactly, not just its last segment.
+    #[test]
+    fn the_cache_key_keeps_every_component() {
+        let key = cache_key(Path::new(
+            "dukascopy/EURUSD/2025/06/15/BID_candles_min_1.bi5",
+        ));
+        assert_eq!(key, "dukascopy/EURUSD/2025/06/15/BID_candles_min_1.bi5");
+    }
+
+    /// The run lock lives inside the output directory and must not be
+    /// mistaken for cached data.
+    #[tokio::test]
+    async fn the_run_lock_directory_is_not_reported_as_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = crate::utils::run_lock::acquire_run_lock(dir.path()).unwrap();
+        write(
+            &dir.path()
+                .join("dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),
+            b"bi5",
+        );
+
+        let files = scan_local_files(dir.path()).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files.contains("dukascopy/EURUSD/2025/BID_candles_day_1.bi5"));
+        assert!(lock.path().is_dir(), "the lock must survive the scan");
+    }
 }

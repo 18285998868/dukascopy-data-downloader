@@ -48,7 +48,12 @@ impl Symbol {
     /// ```
     pub fn new(value: impl Into<String>) -> Result<Self, AppError> {
         let value = value.into();
-        if value.len() < MIN_SYMBOL_LEN || value.len() > MAX_SYMBOL_LEN {
+        // Count *characters*, not bytes: the limit is documented as a
+        // character count, and a two-character non-ASCII name is three
+        // bytes long — measuring bytes would let it past a length check
+        // that claims to count characters.
+        let len = value.chars().count();
+        if !(MIN_SYMBOL_LEN..=MAX_SYMBOL_LEN).contains(&len) {
             return Err(AppError::Config(format!(
                 "symbol {value:?} must be {MIN_SYMBOL_LEN}..={MAX_SYMBOL_LEN} characters"
             )));
@@ -229,7 +234,11 @@ impl Default for AppConfig {
 /// Upper bound for the shared download gate (also the client pool size).
 const MAX_CONCURRENCY: usize = 256;
 /// Upper bound for the *effective* start..=end range (fail fast on typos).
-const MAX_RANGE_DAYS: i64 = 366 * 15;
+///
+/// 366 × 15 days — fifteen years of the widest bucket (one file per day).
+/// The limit is part of the public contract: a configuration that exceeds
+/// it is rejected instead of expanding into tens of thousands of requests.
+pub const MAX_RANGE_DAYS: i64 = 366 * 15;
 /// Start date used when `start` is not configured.
 pub const DEFAULT_START: chrono::NaiveDate =
     chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("2020-01-01 is a valid calendar date");
@@ -436,6 +445,28 @@ mod tests {
         for bad in ["EU", "", "A23456789012345678901234"] {
             assert!(Symbol::new(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    /// The length limit counts *characters*, not bytes.
+    ///
+    /// A two-character non-ASCII symbol is three bytes long, so a
+    /// byte-based check would let it through a limit that is documented
+    /// as 3..=20 characters.
+    #[test]
+    fn symbol_length_is_measured_in_characters() {
+        // "欧元" is two characters but six bytes.
+        let err = Symbol::new("欧元").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("3..=20 characters"), "{msg}");
+        assert!(msg.contains("欧元"), "{msg}");
+    }
+
+    /// The length check runs before the charset check, so a multi-byte
+    /// symbol that is *long enough* still fails on its characters.
+    #[test]
+    fn symbol_rejects_non_ascii_even_when_it_is_long_enough() {
+        let err = Symbol::new("欧元欧元欧元").unwrap_err();
+        assert!(err.to_string().contains("uppercase ASCII"), "{err}");
     }
 
     #[test]
@@ -745,5 +776,13 @@ mod tests {
             .unwrap();
         assert_eq!(s, start);
         assert_eq!(e, end);
+    }
+
+    /// The cap is part of the public contract, so it is exported rather
+    /// than kept private to the module.
+    #[test]
+    fn the_range_cap_is_a_public_constant() {
+        assert_eq!(MAX_RANGE_DAYS, 366 * 15);
+        assert_eq!(crate::MAX_RANGE_DAYS, MAX_RANGE_DAYS);
     }
 }

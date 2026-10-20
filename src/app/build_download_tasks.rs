@@ -10,11 +10,14 @@ use std::path::Path;
 use super::build_urls::build_urls;
 use crate::config::{DownloadTask, PriceType, Symbol, Timeframe};
 
-/// Build a list of DownloadTasks for a date range, skipping locally-present files.
+/// Build a list of `DownloadTask`s for a date range, skipping locally-present files.
 ///
 /// `local` holds `output_dir`-relative paths (e.g.
 /// `dukascopy/EURUSD/2025/BID_candles_day_1.bi5`) as produced by
 /// [`crate::utils::scan_local_files::scan_local_files`].
+///
+/// The cache set is generic over its hasher so a caller is free to use a
+/// cheaper one than the default `RandomState`.
 ///
 /// # Examples
 ///
@@ -38,13 +41,14 @@ use crate::config::{DownloadTask, PriceType, Symbol, Timeframe};
 /// );
 /// assert_eq!(tasks[0].symbol, symbol);
 /// ```
-pub fn build_download_tasks(
+#[must_use]
+pub fn build_download_tasks<S: std::hash::BuildHasher>(
     symbol: &Symbol,
     timeframe: Timeframe,
     price_type: PriceType,
     start: chrono::NaiveDate,
     end: chrono::NaiveDate,
-    local: &HashSet<String>,
+    local: &HashSet<String, S>,
     data_dir: &Path,
 ) -> Vec<DownloadTask> {
     build_urls(symbol, price_type, timeframe, start, end)

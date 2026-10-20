@@ -191,6 +191,46 @@ mod tests {
         assert!(a.base.current_interval > fresh.base.current_interval);
     }
 
+    /// `reset` puts the policy back to its first interval.
+    ///
+    /// The retry driver calls it between independent operations; without it
+    /// the interval would keep growing for the lifetime of the policy.
+    #[test]
+    fn reset_restarts_the_interval_growth() {
+        let mut b = default_backoff();
+        let first = b.next_backoff().expect("first interval");
+        let _ = b.next_backoff().expect("second interval");
+        let grown = b.base.current_interval;
+        assert!(
+            grown > b.base.initial_interval,
+            "the interval must have grown"
+        );
+
+        b.reset();
+        assert_eq!(b.base.current_interval, b.base.initial_interval);
+        let after_reset = b.next_backoff().expect("interval after the reset");
+        // The interval is randomised by ±50%, so only the order is checked.
+        assert!(
+            after_reset <= first.max(grown),
+            "unexpected interval {after_reset:?}"
+        );
+    }
+
+    /// A reset policy still obeys the budget.
+    #[test]
+    fn a_reset_policy_still_obeys_the_budget() {
+        let budget = Arc::new(RetryBudget::new(Duration::from_millis(5)));
+        let mut b = BoundedBackoff::new(Arc::clone(&budget));
+        let _ = b.next_backoff();
+        b.reset();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            b.next_backoff(),
+            None,
+            "an exhausted budget stops the policy"
+        );
+    }
+
     #[test]
     fn the_budget_counts_down() {
         let budget = RetryBudget::new(Duration::from_millis(50));

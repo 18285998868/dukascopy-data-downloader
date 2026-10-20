@@ -25,6 +25,7 @@ use tokio::task::JoinSet;
 
 use crate::AppError;
 use crate::config::{AppConfig, Symbol, Timeframe};
+use download::DownloadOptions;
 
 /// Maximum number of pair-level error details retained in the batch summary.
 const MAX_BATCH_ERRORS: usize = 20;
@@ -52,6 +53,8 @@ struct SharedRun {
     end: chrono::NaiveDate,
     /// Current UTC date, used to tell final buckets from unfinished ones.
     today: chrono::NaiveDate,
+    /// How a range the feed does not have is treated.
+    opts: DownloadOptions,
 }
 
 /// Everything one pair needs, borrowed from a [`SharedRun`].
@@ -67,10 +70,15 @@ struct PairCtx<'a> {
 /// 2. Scan existing local files (once)
 /// 3. Run every symbol x timeframe pair concurrently through the shared gate
 ///
+/// The run is interruptible: a `SIGINT` (Ctrl+C) or a `SIGTERM` cancels it,
+/// releases the run lock and makes the program exit with
+/// [`AppError::Interrupted`].
+///
 /// # Errors
 ///
 /// Returns [`AppError`] if configuration loading, client construction, scanning,
-/// or the resolved date range fails, or if any pair failed.
+/// or the resolved date range fails, if any pair failed, or if the run was
+/// interrupted.
 ///
 /// # Examples
 ///
@@ -80,6 +88,26 @@ struct PairCtx<'a> {
 /// # }
 /// ```
 pub async fn run(config_path: &Path) -> Result<(), AppError> {
+    run_with(config_path, &DownloadOptions::default()).await
+}
+
+/// Run the full batch download pipeline with explicit options.
+///
+/// This is [`run`] plus the options that decide what happens to a range
+/// the feed does not have; see [`DownloadOptions::allow_missing`].
+///
+/// # Errors
+///
+/// Returns [`AppError`] if configuration loading, client construction, scanning,
+/// or the resolved date range fails, if any pair failed, or if the run was
+/// interrupted.
+pub async fn run_with(config_path: &Path, opts: &DownloadOptions) -> Result<(), AppError> {
+    // Install the OS handlers for the termination signals *first*: the
+    // handler has to be in place before the run lock is taken. Otherwise a
+    // Ctrl+C during start-up would kill the process with the default
+    // disposition — no unwinding, no `Drop` — and leave the lock behind.
+    let termination = termination_signal();
+
     // Reading the file is blocking I/O; `spawn_blocking` keeps it off the
     // async worker threads. The file is tiny, so the scheduling cost is in
     // the same order as the read itself — but the worker never stalls.
@@ -91,11 +119,86 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
     // Take the exclusive lock on the output directory. Two instances sharing
     // one `output_dir` would delete each other's scratch files.
     let output_dir = cfg.output_dir.clone();
-    let _lock =
+    let lock =
         tokio::task::spawn_blocking(move || crate::utils::run_lock::acquire_run_lock(&output_dir))
             .await
             .map_err(AppError::from)??;
 
+    // The lock guard is owned by the *pipeline future*, so dropping that
+    // future — which is exactly what an interruption does — releases the
+    // lock. The acquisition itself happens before the cancellation point on
+    // purpose: a lock that is created *after* the interruption would never
+    // be released.
+    tokio::select! {
+        biased;
+        result = run_pipeline(cfg, opts, lock) => result,
+        signal = termination => Err(AppError::Interrupted { signal }),
+    }
+}
+
+/// Wait for a signal that asks the process to stop.
+///
+/// Returns the name of the signal that arrived.
+///
+/// The OS handlers are installed when this function is *called*, not when
+/// the returned future is first polled: `tokio::signal::unix::signal`
+/// registers the handler at call time, while `tokio::signal::ctrl_c` would
+/// only do so on the first poll. The distinction matters — the handler has
+/// to be in place before the run lock is taken.
+fn termination_signal() -> impl Future<Output = &'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let interrupt = signal(SignalKind::interrupt());
+        let terminate = signal(SignalKind::terminate());
+        async move {
+            match (interrupt, terminate) {
+                (Ok(mut interrupt), Ok(mut terminate)) => {
+                    tokio::select! {
+                        _ = interrupt.recv() => "SIGINT",
+                        _ = terminate.recv() => "SIGTERM",
+                    }
+                }
+                (Ok(mut interrupt), Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not install the SIGTERM handler; Ctrl+C still works"
+                    );
+                    let _ = interrupt.recv().await;
+                    "SIGINT"
+                }
+                (Err(e), _) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not install the SIGINT handler; the run cannot be interrupted cleanly"
+                    );
+                    // Nothing to wait for: park forever so this branch of
+                    // the outer select never wins.
+                    std::future::pending::<&'static str>().await
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        async move {
+            let _ = ctrl_c.await;
+            "SIGINT"
+        }
+    }
+}
+
+/// The download pipeline proper.
+///
+/// Owns the run lock for its whole lifetime: dropping this future — which
+/// is what an interruption does — releases the lock, so the next run can
+/// start without a manual cleanup.
+async fn run_pipeline(
+    cfg: AppConfig,
+    opts: &DownloadOptions,
+    _lock: crate::utils::run_lock::RunLock,
+) -> Result<(), AppError> {
     // Resolve the range *before* any I/O: it is pure arithmetic, so a
     // misconfigured range costs nothing instead of a full disk scan.
     let today = chrono::Utc::now().date_naive();
@@ -141,6 +244,7 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
         start,
         end,
         today,
+        opts: *opts,
     };
 
     let mut pairs = JoinSet::new();
@@ -215,7 +319,7 @@ struct JoinFailure {
 
 /// Render a [`tokio::task::JoinError`], keeping the panic payload when there is one.
 ///
-/// [`JoinError`]'s `Display` only says *that* a task panicked, never *why*:
+/// [`tokio::task::JoinError`]'s `Display` only says *that* a task panicked, never *why*:
 /// the message lives in the panic payload, which `Display` drops. Recovering
 /// it here is the difference between "task 7 panicked" and a usable bug
 /// report — the panic payload is the only place the original message exists
@@ -274,6 +378,7 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
         start,
         end,
         today,
+        opts,
     } = shared;
     let (start, end, today) = (*start, *end, *today);
 
@@ -332,7 +437,7 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
     }
 
     tracing::debug!(symbol = %symbol, files = tasks.len(), "downloading");
-    let stats = download::run_downloads(client, tasks, cfg.concurrency, gate).await?;
+    let stats = download::run_downloads_with(client, tasks, cfg.concurrency, gate, opts).await?;
     tracing::info!(
         symbol = %symbol,
         timeframe = %timeframe,
