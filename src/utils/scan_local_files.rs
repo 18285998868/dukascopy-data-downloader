@@ -26,7 +26,7 @@ fn cache_key(rel: &Path) -> String {
     }
 }
 
-/// Scan `data_dir` for existing `.bi5` files, removing stale `.bi5.tmp` files.
+/// Scan `data_dir` for existing `.bi5` files, removing stale scratch files.
 ///
 /// Returns a set of `data_dir`-relative paths (e.g.
 /// `dukascopy/EURUSD/2025/BID_candles_day_1.bi5`), which is exactly the shape
@@ -34,8 +34,12 @@ fn cache_key(rel: &Path) -> String {
 /// membership directly. Paths always use `/` as the separator, on every
 /// platform. A missing directory yields an empty set.
 ///
-/// Only `*.bi5.tmp` scratch files are deleted — a blanket `*.tmp` sweep would
-/// destroy unrelated temporary files if `data_dir` ever points somewhere shared.
+/// Two kinds of file are deleted rather than reported as cached:
+///
+/// - `*.bi5.tmp` scratch files left by an interrupted run;
+/// - zero-length `.bi5` files, which cannot be a valid LZMA container. A
+///   non-empty sweep of `*.tmp` would destroy unrelated temporary files if
+///   `data_dir` ever points somewhere shared, so the deletion stays narrow.
 ///
 /// # Errors
 ///
@@ -86,6 +90,35 @@ pub async fn scan_local_files(data_dir: &Path) -> Result<HashSet<String>, AppErr
             }
 
             if name.ends_with(BI5_SUFFIX) {
+                match entry.metadata() {
+                    Ok(meta) if meta.len() == 0 => {
+                        // A zero-length `.bi5` cannot be a valid LZMA
+                        // container. Treating it as cached would freeze the
+                        // hole forever; removing it makes the next run fetch
+                        // the file again (and fail loudly if the server keeps
+                        // answering with an empty body).
+                        if let Err(err) = std::fs::remove_file(entry.path()) {
+                            tracing::warn!(
+                                path = %entry.path().display(),
+                                error = %err,
+                                "failed to remove empty bi5 file",
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        // The file exists but cannot be stat'ed. Keep it in
+                        // the cache: re-downloading would hit the same
+                        // permission problem, and a spurious re-download
+                        // loop is worse than trusting the existing entry.
+                        tracing::warn!(
+                            path = %entry.path().display(),
+                            error = %err,
+                            "failed to read metadata; treating the file as cached",
+                        );
+                    }
+                }
                 files.insert(cache_key(rel));
             }
         }
@@ -181,16 +214,27 @@ mod tests {
         assert_eq!(files.len(), 0, "a .tmp is never reported as cached");
     }
 
+    /// A zero-length `.bi5` is not a valid payload. Leaving it in the cache
+    /// would freeze the hole forever, so the scan removes it and lets the
+    /// next run redownload it.
     #[tokio::test]
-    async fn empty_bi5_file_is_still_reported_as_cached() {
-        // A zero-length file must not silently cause a re-download loop.
+    async fn empty_bi5_file_is_removed_and_not_cached() {
         let dir = tempfile::tempdir().unwrap();
+        let empty = dir
+            .path()
+            .join("dukascopy/EURUSD/2025/BID_candles_day_1.bi5");
+        write(&empty, b"");
         write(
             &dir.path()
-                .join("dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),
-            b"",
+                .join("dukascopy/EURUSD/2026/BID_candles_day_1.bi5"),
+            b"bi5",
         );
-        assert_eq!(scan_local_files(dir.path()).await.unwrap().len(), 1);
+
+        let files = scan_local_files(dir.path()).await.unwrap();
+
+        assert_eq!(files.len(), 1, "only the non-empty file is cached");
+        assert!(files.contains("dukascopy/EURUSD/2026/BID_candles_day_1.bi5"));
+        assert!(!empty.exists(), "the empty payload must be removed");
     }
 
     #[tokio::test]

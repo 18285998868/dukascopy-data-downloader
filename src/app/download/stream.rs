@@ -22,7 +22,10 @@ use crate::utils::backoff::{BoundedBackoff, default_backoff};
 /// # Errors
 ///
 /// Returns [`crate::AppError::NotFound`] on HTTP 404 (not retried), and any
-/// other [`crate::AppError`] once the backoff policy is exhausted.
+/// other [`crate::AppError`] once the backoff policy is exhausted. A 200 with
+/// an empty body is rejected as [`crate::AppError::DownloadFailed`] and is not
+/// retried: it cannot be a valid `.bi5`, and committing it would poison the
+/// cache.
 ///
 /// # Examples
 ///
@@ -125,6 +128,109 @@ fn io_error(path: &std::path::Path, source: std::io::Error) -> crate::AppError {
     }
 }
 
+/// Stream the response body into `dest` atomically.
+///
+/// The payload is written to a `.bi5.tmp` sibling, synced to stable storage,
+/// renamed into place and the parent directory is synced. A body that arrives
+/// empty is rejected — see the comment at the check.
+async fn write_body_to_file(
+    resp: &mut reqwest::Response,
+    dest: &std::path::Path,
+    url: &str,
+) -> Result<(), BackoffError<crate::AppError>> {
+    if let Some(p) = dest.parent() {
+        tokio::fs::create_dir_all(p)
+            .await
+            .map_err(|e| BackoffError::Permanent(io_error(p, e)))?;
+    }
+
+    // Drop any scratch file left by an interrupted run before writing,
+    // so `File::create` cannot append to stale bytes.
+    let tmp_path = tmp_path_for(dest);
+    match tokio::fs::remove_file(&tmp_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BackoffError::Permanent(io_error(&tmp_path, e))),
+    }
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+
+    let mut written = 0usize;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| BackoffError::Transient {
+        err: crate::AppError::from(e),
+        retry_after: None,
+    })? {
+        written = written.saturating_add(chunk.len());
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+    }
+
+    // A 200 with an empty body is not a valid `.bi5`: the LZMA container
+    // always has a header. Committing it would poison the cache, because the
+    // scanner treats any `.bi5` name as a complete download and would never
+    // fetch the file again. The server did answer, it just answered with
+    // nothing, so retrying the same URL is not expected to help.
+    if written == 0 {
+        drop(file);
+        // Best effort: a leftover scratch file is swept by the next cache
+        // scan, so a failure here must not mask the real error.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(BackoffError::Permanent(crate::AppError::DownloadFailed {
+            url: url.to_string(),
+            reason: "empty response body (HTTP 200 with no payload)".to_string(),
+        }));
+    }
+
+    // `sync_all` is what actually hands the bytes to the disk: it flushes the
+    // operating system's buffers and waits for the storage to acknowledge.
+    // (`flush` on a `File` is a no-op, and it would only cost an extra hop
+    // through the blocking pool.) Without the `sync_all` a power loss could
+    // leave a renamed-but-empty `.bi5`, which the cache scan treats as
+    // complete forever.
+    file.sync_all()
+        .await
+        .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+    drop(file);
+
+    tokio::fs::rename(&tmp_path, dest)
+        .await
+        .map_err(|e| BackoffError::Permanent(io_error(dest, e)))?;
+
+    // `sync_all` on the file made its *contents* durable, but the directory
+    // entry created by the rename is still in the page cache. Without this
+    // fsync a power loss can undo the rename itself, leaving the payload
+    // behind under its scratch name.
+    //
+    // A failure here is not a download failure: the payload is on disk, only
+    // the durability of the *rename* is in question. Some filesystems refuse
+    // to open a directory at all, so the error is logged rather than
+    // propagated.
+    if let Some(parent) = dest.parent() {
+        match tokio::fs::File::open(parent).await {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all().await {
+                    tracing::debug!(
+                        path = %parent.display(),
+                        error = %e,
+                        "could not fsync the parent directory; the rename may not be durable",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = %parent.display(),
+                    error = %e,
+                    "could not open the parent directory for fsync; the rename may not be durable",
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn download_to_file_with_backoff(
     client: &reqwest::Client,
     task: &DownloadTask,
@@ -178,80 +284,7 @@ async fn download_to_file_with_backoff(
                 });
             }
 
-            if let Some(p) = dest.parent() {
-                tokio::fs::create_dir_all(p)
-                    .await
-                    .map_err(|e| BackoffError::Permanent(io_error(p, e)))?;
-            }
-
-            // Drop any scratch file left by an interrupted run before writing,
-            // so `File::create` cannot append to stale bytes.
-            let tmp_path = tmp_path_for(&dest);
-            match tokio::fs::remove_file(&tmp_path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(BackoffError::Permanent(io_error(&tmp_path, e))),
-            }
-            let mut file = tokio::fs::File::create(&tmp_path)
-                .await
-                .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
-
-            while let Some(chunk) = resp.chunk().await.map_err(|e| BackoffError::Transient {
-                err: crate::AppError::from(e),
-                retry_after: None,
-            })? {
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
-            }
-
-            // `sync_all` is what actually hands the bytes to the disk: it
-            // flushes the operating system's buffers and waits for the
-            // storage to acknowledge. (`flush` on a `File` is a no-op, and
-            // it would only cost an extra hop through the blocking pool.)
-            // Without the `sync_all` a power loss could leave a
-            // renamed-but-empty `.bi5`, which the cache scan treats as
-            // complete forever.
-            file.sync_all()
-                .await
-                .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
-            drop(file);
-
-            tokio::fs::rename(&tmp_path, &dest)
-                .await
-                .map_err(|e| BackoffError::Permanent(io_error(&dest, e)))?;
-
-            // `sync_all` on the file made its *contents* durable, but the
-            // directory entry created by the rename is still in the page
-            // cache. Without this fsync a power loss can undo the rename
-            // itself, leaving the payload behind under its scratch name.
-            //
-            // A failure here is not a download failure: the payload is on
-            // disk, only the durability of the *rename* is in question.
-            // Some filesystems refuse to open a directory at all, so the
-            // error is logged rather than propagated.
-            if let Some(parent) = dest.parent() {
-                match tokio::fs::File::open(parent).await {
-                    Ok(dir) => {
-                        if let Err(e) = dir.sync_all().await {
-                            tracing::debug!(
-                                path = %parent.display(),
-                                error = %e,
-                                "could not fsync the parent directory; the rename may not be durable",
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            path = %parent.display(),
-                            error = %e,
-                            "could not open the parent directory for fsync; the rename may not be durable",
-                        );
-                    }
-                }
-            }
-
-            Ok(())
+            write_body_to_file(&mut resp, &dest, &u).await
         }
     };
 
@@ -400,6 +433,13 @@ mod tests {
         );
     }
 
+    /// A value that does not fit in `u64` is malformed, not a huge wait.
+    #[test]
+    fn parse_retry_after_rejects_a_value_that_does_not_fit() {
+        assert_eq!(parse_retry_after("18446744073709551616"), None);
+        assert_eq!(parse_retry_after("99999999999999999999999"), None);
+    }
+
     // — scratch path —
 
     #[test]
@@ -461,17 +501,30 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"fresh");
     }
 
+    /// An HTTP 200 with no payload is not a valid `.bi5`. Committing it would
+    /// poison the cache: the scanner treats any `.bi5` name as a complete
+    /// download, so the empty file would never be fetched again.
     #[tokio::test]
-    async fn empty_body_produces_an_empty_file() {
+    async fn empty_body_is_not_committed() {
         let server = server_returning(ResponseTemplate::new(200)).await;
         let dir = TempDir::new().unwrap();
         let dest = dir.path().join("BID_candles_day_1.bi5");
 
-        download_to_file_with_backoff(&client(), &task(&server, &dest), no_retry())
+        let err = download_to_file_with_backoff(&client(), &task(&server, &dest), no_retry())
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(std::fs::read(&dest).unwrap(), b"");
+        match err {
+            AppError::DownloadFailed { reason, .. } => {
+                assert!(reason.contains("empty response body"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(!dest.exists(), "an empty payload must not be committed");
+        assert!(
+            !tmp_path_for(&dest).exists(),
+            "the scratch file must be removed"
+        );
     }
 
     #[tokio::test]

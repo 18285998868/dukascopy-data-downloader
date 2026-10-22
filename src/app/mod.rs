@@ -101,6 +101,28 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
 /// Returns [`AppError`] if configuration loading, client construction, scanning,
 /// or the resolved date range fails, if any pair failed, or if the run was
 /// interrupted.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> Result<(), ddd::AppError> {
+/// // Strict: a range the feed does not have fails the run.
+/// ddd::app::run_with(
+///     std::path::Path::new("config.toml"),
+///     &ddd::DownloadOptions::default(),
+/// )
+/// .await?;
+///
+/// // Best effort: keep whatever the feed did have.
+/// ddd::app::run_with(
+///     std::path::Path::new("config.toml"),
+///     &ddd::DownloadOptions {
+///         allow_missing: true,
+///     },
+/// )
+/// .await
+/// # }
+/// ```
 pub async fn run_with(config_path: &Path, opts: &DownloadOptions) -> Result<(), AppError> {
     // Install the OS handlers for the termination signals *first*: the
     // handler has to be in place before the run lock is taken. Otherwise a
@@ -126,9 +148,9 @@ pub async fn run_with(config_path: &Path, opts: &DownloadOptions) -> Result<(), 
 
     // The lock guard is owned by the *pipeline future*, so dropping that
     // future — which is exactly what an interruption does — releases the
-    // lock. The acquisition itself happens before the cancellation point on
-    // purpose: a lock that is created *after* the interruption would never
-    // be released.
+    // lock. The `spawn_blocking` task that creates it cannot be cancelled: if
+    // the future is dropped first, the task still finishes and its `RunLock`
+    // is dropped immediately, so no lock is leaked either way.
     tokio::select! {
         biased;
         result = run_pipeline(cfg, opts, lock) => result,
@@ -512,6 +534,25 @@ mod tests {
     #[test]
     fn build_client_succeeds() {
         assert!(build_client().is_ok());
+    }
+
+    /// A second run on the same output directory must be refused before it
+    /// can unlink the first run's scratch files.
+    ///
+    /// The lock lives in the *pipeline*, so this also pins down that the
+    /// refusal surfaces through the public [`run`] entry point instead of
+    /// being swallowed by the signal select.
+    #[tokio::test]
+    async fn run_refuses_a_second_instance_on_the_same_output_dir() {
+        let (dir, path) = config(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"2025-01-01\"\nend = \"2025-01-01\"\n",
+        );
+        let lock = crate::utils::run_lock::acquire_run_lock(dir.path()).unwrap();
+
+        let err = run(&path).await.unwrap_err();
+        assert!(err.to_string().contains("another instance"), "{err}");
+
+        drop(lock);
     }
 
     #[tokio::test]

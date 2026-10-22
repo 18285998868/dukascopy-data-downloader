@@ -589,6 +589,26 @@ mod tests {
         assert_eq!(previous_month_last_day(date(2024, 3, 1)), date(2024, 2, 29));
     }
 
+    /// New Year's Day is the one boundary where both the yearly and the
+    /// monthly bucket have just closed: the previous year and the previous
+    /// month end on the same calendar day.
+    #[test]
+    fn new_year_closes_the_previous_year_and_month() {
+        let today = date(2026, 1, 1);
+        for tf in [Timeframe::D1, Timeframe::H1] {
+            assert_eq!(
+                last_closed_day(tf, date(2025, 12, 31), today),
+                date(2025, 12, 31),
+                "{tf:?}: the bucket that ended yesterday is closed"
+            );
+            assert_eq!(
+                last_closed_day(tf, date(2026, 1, 1), today),
+                date(2025, 12, 31),
+                "{tf:?}: the bucket that started today is still open"
+            );
+        }
+    }
+
     // — timeframe mapping —
 
     #[test]

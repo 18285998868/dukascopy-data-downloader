@@ -80,21 +80,46 @@ async fn a_missing_file_is_reported_and_leaves_no_trace() {
     );
 }
 
+/// A batch that downloaded nothing is an unavailable range, not a success:
+/// a single-file batch is too small for the ratio check, but "nothing at
+/// all" is unambiguous.
 #[tokio::test]
-async fn a_batch_counts_a_404_without_failing() {
+async fn a_batch_of_only_404s_is_an_unavailable_range() {
     let server = server_returning(ResponseTemplate::new(404)).await;
     let dir = tempfile::tempdir().unwrap();
     let tasks = vec![task(&server, dir.path().join("a/BID_candles_hour_1.bi5"))];
 
     let gate = Arc::new(Semaphore::new(4));
-    let stats = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, 4, &gate)
+    let err = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, 4, &gate)
         .await
-        .expect("a 404 is an expected answer, not a batch failure");
+        .unwrap_err();
 
-    assert_eq!(stats.total, 1);
-    assert_eq!(stats.not_found, 1);
-    assert_eq!(stats.ok, 0);
-    assert_eq!(stats.failed, 0);
+    assert!(
+        matches!(err, ddd::AppError::RangeUnavailable { .. }),
+        "{err:?}"
+    );
+}
+
+/// A 200 with an empty body must not be committed to the cache.
+#[tokio::test]
+async fn an_empty_200_body_is_not_committed() {
+    let server = server_returning(ResponseTemplate::new(200)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("EURUSD/2025/06/BID_candles_hour_1.bi5");
+
+    let err = ddd::app::download::stream::download_to_file(
+        &reqwest::Client::new(),
+        &task(&server, dest.clone()),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ddd::AppError::DownloadFailed { .. }),
+        "{err:?}"
+    );
+    assert!(!dest.exists(), "an empty payload must not be committed");
+    assert!(!tmp_path(&dest).exists(), "no scratch file may be left");
 }
 
 #[tokio::test]
