@@ -8,12 +8,10 @@
 
 use std::time::Duration;
 
-use backoff::Error as BackoffError;
-use backoff::future::retry;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::DownloadTask;
-use crate::utils::backoff::{BoundedBackoff, default_backoff};
+use crate::utils::backoff::{Retry, RetryError, default_retry};
 
 /// Download a bi5 file with retry, streaming directly to disk.
 ///
@@ -22,7 +20,7 @@ use crate::utils::backoff::{BoundedBackoff, default_backoff};
 /// # Errors
 ///
 /// Returns [`crate::AppError::NotFound`] on HTTP 404 (not retried), and any
-/// other [`crate::AppError`] once the backoff policy is exhausted. A 200 with
+/// other [`crate::AppError`] once the retry budget is exhausted. A 200 with
 /// an empty body is rejected as [`crate::AppError::DownloadFailed`] and is not
 /// retried: it cannot be a valid `.bi5`, and committing it would poison the
 /// cache.
@@ -49,7 +47,7 @@ pub async fn download_to_file(
     client: &reqwest::Client,
     task: &DownloadTask,
 ) -> Result<(), crate::AppError> {
-    download_to_file_with_backoff(client, task, default_backoff()).await
+    download_to_file_with_backoff(client, task, default_retry()).await
 }
 
 /// The verdict on one HTTP response.
@@ -66,7 +64,7 @@ struct StatusVerdict {
 ///
 /// `retry_after` is the server-supplied wait hint (from `Retry-After`).
 /// It is reported separately from the error because it must be spent by the
-/// *operation*, not handed to the retry driver: see
+/// *operation*, not handed to the retry loop: see
 /// [`download_to_file_with_backoff`] for why.
 fn classify_status(
     status: reqwest::StatusCode,
@@ -137,11 +135,11 @@ async fn write_body_to_file(
     resp: &mut reqwest::Response,
     dest: &std::path::Path,
     url: &str,
-) -> Result<(), BackoffError<crate::AppError>> {
+) -> Result<(), RetryError<crate::AppError>> {
     if let Some(p) = dest.parent() {
         tokio::fs::create_dir_all(p)
             .await
-            .map_err(|e| BackoffError::Permanent(io_error(p, e)))?;
+            .map_err(|e| RetryError::permanent(io_error(p, e)))?;
     }
 
     // Drop any scratch file left by an interrupted run before writing,
@@ -150,21 +148,22 @@ async fn write_body_to_file(
     match tokio::fs::remove_file(&tmp_path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(BackoffError::Permanent(io_error(&tmp_path, e))),
+        Err(e) => return Err(RetryError::permanent(io_error(&tmp_path, e))),
     }
     let mut file = tokio::fs::File::create(&tmp_path)
         .await
-        .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+        .map_err(|e| RetryError::permanent(io_error(&tmp_path, e)))?;
 
     let mut written = 0usize;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| BackoffError::Transient {
-        err: crate::AppError::from(e),
-        retry_after: None,
-    })? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| RetryError::transient(crate::AppError::from(e)))?
+    {
         written = written.saturating_add(chunk.len());
         file.write_all(&chunk)
             .await
-            .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+            .map_err(|e| RetryError::permanent(io_error(&tmp_path, e)))?;
     }
 
     // A 200 with an empty body is not a valid `.bi5`: the LZMA container
@@ -177,7 +176,7 @@ async fn write_body_to_file(
         // Best effort: a leftover scratch file is swept by the next cache
         // scan, so a failure here must not mask the real error.
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(BackoffError::Permanent(crate::AppError::DownloadFailed {
+        return Err(RetryError::permanent(crate::AppError::DownloadFailed {
             url: url.to_string(),
             reason: "empty response body (HTTP 200 with no payload)".to_string(),
         }));
@@ -191,12 +190,12 @@ async fn write_body_to_file(
     // complete forever.
     file.sync_all()
         .await
-        .map_err(|e| BackoffError::Permanent(io_error(&tmp_path, e)))?;
+        .map_err(|e| RetryError::permanent(io_error(&tmp_path, e)))?;
     drop(file);
 
     tokio::fs::rename(&tmp_path, dest)
         .await
-        .map_err(|e| BackoffError::Permanent(io_error(dest, e)))?;
+        .map_err(|e| RetryError::permanent(io_error(dest, e)))?;
 
     // `sync_all` on the file made its *contents* durable, but the directory
     // entry created by the rename is still in the page cache. Without this
@@ -234,25 +233,19 @@ async fn write_body_to_file(
 async fn download_to_file_with_backoff(
     client: &reqwest::Client,
     task: &DownloadTask,
-    backoff: BoundedBackoff,
+    retry: Retry,
 ) -> Result<(), crate::AppError> {
     // The budget is shared: the operation clamps a server wait hint against
-    // it, the policy stops when it is gone.
-    let budget = backoff.budget();
+    // it, the retry loop stops when it is gone.
+    let budget = retry.budget();
     let op = || {
         let c = client.clone();
         let u = task.url.clone();
         let dest = task.dest.clone();
-        let budget = budget.clone();
         async move {
             let mut resp = match c.get(&u).send().await {
                 Ok(r) => r,
-                Err(e) => {
-                    return Err(BackoffError::Transient {
-                        err: crate::AppError::from(e),
-                        retry_after: None,
-                    });
-                }
+                Err(e) => return Err(RetryError::transient(crate::AppError::from(e))),
             };
             if let Some(verdict) = classify_status(
                 resp.status(),
@@ -263,32 +256,29 @@ async fn download_to_file_with_backoff(
                 &u,
             ) {
                 if !verdict.transient {
-                    return Err(BackoffError::Permanent(verdict.error));
+                    return Err(RetryError::permanent(verdict.error));
                 }
-                // The wait hint is spent here and *not* handed to
-                // `backoff::future::retry`: that crate prefers the hint over
-                // the policy's own interval, which means the policy — and
-                // with it the only budget check — is never consulted. A
-                // server answering every retry with `Retry-After` would
-                // then keep this file retrying forever. Waiting here charges
-                // the hint to the budget and keeps the policy in charge.
+                // The wait hint is spent here and *not* handed to the retry
+                // loop: a hint passed to backon's `adjust` hook would replace
+                // the policy's own interval, and with it the only deadline
+                // check, so a server answering every retry with
+                // `Retry-After` could keep this file retrying forever.
+                // Waiting here charges the hint to the budget and keeps the
+                // policy in charge.
                 if let Some(hint) = verdict.wait_hint {
                     let wait = hint.min(budget.remaining());
                     if !wait.is_zero() {
                         tokio::time::sleep(wait).await;
                     }
                 }
-                return Err(BackoffError::Transient {
-                    err: verdict.error,
-                    retry_after: None,
-                });
+                return Err(RetryError::transient(verdict.error));
             }
 
             write_body_to_file(&mut resp, &dest, &u).await
         }
     };
 
-    retry(backoff, op).await
+    retry.run(op).await
 }
 
 #[cfg(test)]
@@ -296,7 +286,7 @@ mod tests {
     use super::*;
     use crate::AppError;
     use crate::config::{Symbol, Timeframe};
-    use crate::utils::backoff::RetryBudget;
+    use crate::utils::backoff::{RetryPolicy, default_policy};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -305,17 +295,26 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Backoff whose budget is already exhausted: it never retries.
-    fn no_retry() -> BoundedBackoff {
-        BoundedBackoff::new(Arc::new(RetryBudget::new(Duration::ZERO)))
+    /// Retry whose budget is already exhausted: it never retries.
+    fn no_retry() -> Retry {
+        Retry::new(default_policy(), Duration::ZERO)
     }
 
-    /// Backoff that retries for a bounded window with tiny intervals.
-    fn fast_retry(max_elapsed: Duration) -> BoundedBackoff {
-        BoundedBackoff::with_base(
-            Arc::new(RetryBudget::new(max_elapsed)),
-            Duration::from_millis(1),
-            1.0,
+    /// Retry that retries for a bounded window with tiny intervals.
+    fn fast_retry(max_elapsed: Duration) -> Retry {
+        retry_with_delay(Duration::from_millis(1), max_elapsed)
+    }
+
+    /// Retry with a fixed interval, bounded by `max_elapsed`.
+    fn retry_with_delay(interval: Duration, max_elapsed: Duration) -> Retry {
+        Retry::new(
+            RetryPolicy::new()
+                .with_min_delay(interval)
+                .with_max_delay(interval)
+                .with_factor(1.0)
+                .with_total_delay(Some(max_elapsed))
+                .without_max_times(),
+            max_elapsed,
         )
     }
 
@@ -647,10 +646,10 @@ mod tests {
     /// A server that answers every retry with `Retry-After` must not be able
     /// to keep a file retrying forever.
     ///
-    /// `backoff::future::retry` prefers the hint over the policy's own
-    /// interval, which means the policy — and with it the only budget check —
-    /// would never be consulted. The hint is therefore spent by the operation
-    /// itself and charged to the budget.
+    /// A hint handed to backon's `adjust` hook would replace the policy's own
+    /// interval, and with it the only deadline check, so the retry loop would
+    /// never stop. The hint is therefore spent by the operation itself and
+    /// charged to the budget.
     #[tokio::test]
     async fn a_retry_after_hint_cannot_outlive_the_budget() {
         let server = MockServer::start().await;
@@ -672,7 +671,7 @@ mod tests {
         let err = download_to_file_with_backoff(
             &client(),
             &task(&server, &dest),
-            BoundedBackoff::new(Arc::new(RetryBudget::new(Duration::from_millis(200)))),
+            Retry::new(default_policy(), Duration::from_millis(200)),
         )
         .await
         .unwrap_err();
@@ -751,11 +750,7 @@ mod tests {
         let err = download_to_file_with_backoff(
             &client(),
             &task(&server, &dest),
-            BoundedBackoff::with_base(
-                Arc::new(RetryBudget::new(Duration::from_millis(200))),
-                Duration::from_millis(10),
-                1.0,
-            ),
+            retry_with_delay(Duration::from_millis(10), Duration::from_millis(200)),
         )
         .await
         .unwrap_err();
