@@ -127,7 +127,7 @@ mod tests {
             date(2025, 1, 2),
             &local,
         );
-        assert!(tasks.is_empty());
+        assert_eq!(tasks.len(), 0);
     }
 
     #[test]
@@ -160,7 +160,7 @@ mod tests {
             date(2025, 5, 31),
             &HashSet::new(),
         );
-        assert!(tasks.is_empty());
+        assert_eq!(tasks.len(), 0);
     }
 
     /// A cache hit for the BID file must not suppress the ASK file.

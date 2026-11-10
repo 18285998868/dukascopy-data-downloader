@@ -354,7 +354,7 @@ mod tests {
         for tf in [Timeframe::M1, Timeframe::H1, Timeframe::D1] {
             for pt in [PriceType::Bid, PriceType::Ask] {
                 let urls = collect("XAUUSD", pt, tf, date(2021, 2, 3), date(2024, 11, 29));
-                assert!(!urls.is_empty());
+                assert_ne!(urls.len(), 0);
                 for u in &urls {
                     assert_eq!(
                         u.url,
@@ -471,16 +471,14 @@ mod tests {
 
     #[test]
     fn empty_range_yields_nothing() {
-        assert!(
-            collect(
-                "EURUSD",
-                PriceType::Bid,
-                Timeframe::D1,
-                date(2025, 1, 5),
-                date(2025, 1, 3)
-            )
-            .is_empty()
+        let urls = collect(
+            "EURUSD",
+            PriceType::Bid,
+            Timeframe::D1,
+            date(2025, 1, 5),
+            date(2025, 1, 3),
         );
+        assert_eq!(urls.len(), 0);
     }
 
     /// The iterator is lazy: taking a prefix must not build the whole range.

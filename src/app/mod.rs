@@ -654,6 +654,6 @@ mod tests {
 
         let failure = describe_join_error(err);
         assert!(!failure.is_panic);
-        assert!(!failure.message.is_empty());
+        assert_ne!(failure.message, "");
     }
 }
