@@ -15,54 +15,25 @@ pub mod build_download_tasks;
 pub mod build_urls;
 pub mod download;
 
-use std::collections::HashSet;
+mod client;
+mod pair;
+mod signal;
+
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::AppError;
-use crate::config::{AppConfig, Symbol, Timeframe};
+use crate::config::AppConfig;
+use client::build_client;
 use download::DownloadOptions;
+use pair::{SharedRun, run_pair};
+use signal::termination_signal;
 
 /// Maximum number of pair-level error details retained in the batch summary.
 const MAX_BATCH_ERRORS: usize = 20;
-/// TCP/TLS connect budget for a single request.
-///
-/// 30s rather than something tighter: the handshake includes the TLS
-/// session, and a slow link to the data feed can spend a long time on it.
-/// A connect timeout that is too tight does not make the run faster, it just
-/// turns a slow download into a failed one.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Total budget for a single request, including body download.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Idle-connection lifetime in the pool.
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// State shared by every pair task. Cloning is cheap: the client is a refcount
-/// bump and the rest are `Arc`s.
-#[derive(Clone)]
-struct SharedRun {
-    client: reqwest::Client,
-    cfg: Arc<AppConfig>,
-    local: Arc<HashSet<String>>,
-    gate: Arc<Semaphore>,
-    start: chrono::NaiveDate,
-    end: chrono::NaiveDate,
-    /// Current UTC date, used to tell final buckets from unfinished ones.
-    today: chrono::NaiveDate,
-    /// How a range the feed does not have is treated.
-    opts: DownloadOptions,
-}
-
-/// Everything one pair needs, borrowed from a [`SharedRun`].
-struct PairCtx<'a> {
-    shared: &'a SharedRun,
-    symbol: &'a Symbol,
-    timeframe: Timeframe,
-}
 
 /// Run the full batch download pipeline.
 ///
@@ -155,59 +126,6 @@ pub async fn run_with(config_path: &Path, opts: &DownloadOptions) -> Result<(), 
         biased;
         result = run_pipeline(cfg, opts, lock) => result,
         signal = termination => Err(AppError::Interrupted { signal }),
-    }
-}
-
-/// Wait for a signal that asks the process to stop.
-///
-/// Returns the name of the signal that arrived.
-///
-/// The OS handlers are installed when this function is *called*, not when
-/// the returned future is first polled: `tokio::signal::unix::signal`
-/// registers the handler at call time, while `tokio::signal::ctrl_c` would
-/// only do so on the first poll. The distinction matters — the handler has
-/// to be in place before the run lock is taken.
-fn termination_signal() -> impl Future<Output = &'static str> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let interrupt = signal(SignalKind::interrupt());
-        let terminate = signal(SignalKind::terminate());
-        async move {
-            match (interrupt, terminate) {
-                (Ok(mut interrupt), Ok(mut terminate)) => {
-                    tokio::select! {
-                        _ = interrupt.recv() => "SIGINT",
-                        _ = terminate.recv() => "SIGTERM",
-                    }
-                }
-                (Ok(mut interrupt), Err(e)) => {
-                    tracing::warn!(
-                        error = %e,
-                        "could not install the SIGTERM handler; Ctrl+C still works"
-                    );
-                    let _ = interrupt.recv().await;
-                    "SIGINT"
-                }
-                (Err(e), _) => {
-                    tracing::warn!(
-                        error = %e,
-                        "could not install the SIGINT handler; the run cannot be interrupted cleanly"
-                    );
-                    // Nothing to wait for: park forever so this branch of
-                    // the outer select never wins.
-                    std::future::pending::<&'static str>().await
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let ctrl_c = tokio::signal::ctrl_c();
-        async move {
-            let _ = ctrl_c.await;
-            "SIGINT"
-        }
     }
 }
 
@@ -366,133 +284,6 @@ fn describe_join_error(err: tokio::task::JoinError) -> JoinFailure {
     }
 }
 
-/// Download one symbol/timeframe pair and report which pair it was.
-///
-/// The label is returned alongside the result because [`JoinSet`] yields
-/// completions out of order.
-#[tracing::instrument(skip(shared), fields(symbol = %symbol, timeframe = %timeframe))]
-async fn run_pair(
-    shared: SharedRun,
-    symbol: Symbol,
-    timeframe: Timeframe,
-) -> (String, Timeframe, Result<(), AppError>) {
-    let ctx = PairCtx {
-        shared: &shared,
-        symbol: &symbol,
-        timeframe,
-    };
-    let result = run_one(ctx).await;
-    (symbol.to_string(), timeframe, result)
-}
-
-/// Download one symbol/timeframe pair.
-async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
-    let PairCtx {
-        shared,
-        symbol,
-        timeframe,
-    } = ctx;
-    let SharedRun {
-        client,
-        cfg,
-        local,
-        gate,
-        start,
-        end,
-        today,
-        opts,
-    } = shared;
-    let (start, end, today) = (*start, *end, *today);
-
-    if start > end {
-        tracing::warn!(
-            symbol = %symbol,
-            timeframe = %timeframe,
-            start = %start,
-            end = %end,
-            "start date after end date, skipping",
-        );
-        return Ok(());
-    }
-
-    // Restrict this pair to buckets that are already final. The server keeps
-    // appending to an unfinished bucket, and the cache never re-downloads a
-    // file it already has — so an unfinished bucket would be frozen at
-    // whatever it held at download time, leaving a permanent hole.
-    let closed_end = build_urls::last_closed_day(timeframe, end, today);
-    if start > closed_end {
-        tracing::debug!(
-            symbol = %symbol,
-            timeframe = %timeframe,
-            start = %start,
-            end = %end,
-            "no finished bucket in the requested range, skipping",
-        );
-        return Ok(());
-    }
-
-    tracing::info!(
-        symbol = %symbol,
-        timeframe = %timeframe,
-        start = %start,
-        end = %closed_end,
-        "processing symbol-timeframe pair",
-    );
-
-    let tasks = build_download_tasks::build_download_tasks(
-        symbol,
-        timeframe,
-        cfg.price_type,
-        start,
-        closed_end,
-        local,
-        &cfg.output_dir,
-    );
-
-    if tasks.is_empty() {
-        tracing::debug!(
-            symbol = %symbol,
-            timeframe = %timeframe,
-            "no files to download, all cached or out of range",
-        );
-        return Ok(());
-    }
-
-    tracing::debug!(symbol = %symbol, files = tasks.len(), "downloading");
-    let stats = download::run_downloads_with(client, tasks, cfg.concurrency, gate, opts).await?;
-    tracing::info!(
-        symbol = %symbol,
-        timeframe = %timeframe,
-        ok = stats.ok,
-        not_found = stats.not_found,
-        failed = stats.failed,
-        skipped = stats.skipped,
-        total = stats.total,
-        "pair download complete",
-    );
-
-    Ok(())
-}
-
-/// Build a direct-connection client (no proxy fallback is attempted).
-///
-/// `REQUEST_TIMEOUT` bounds one attempt while the backoff policy in
-/// [`crate::utils::backoff`] governs the retry window. The two are deliberately
-/// on different scales: at equal values a single stalled attempt could consume
-/// the whole retry budget and leave no room for a second try.
-fn build_client() -> Result<reqwest::Client, AppError> {
-    Ok(reqwest::Client::builder()
-        .user_agent(concat!(
-            "dukascopy-data-downloader/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .pool_max_idle_per_host(256)
-        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,11 +320,6 @@ mod tests {
         )
         .unwrap();
         (dir, path)
-    }
-
-    #[test]
-    fn build_client_succeeds() {
-        assert!(build_client().is_ok());
     }
 
     /// A second run on the same output directory must be refused before it
