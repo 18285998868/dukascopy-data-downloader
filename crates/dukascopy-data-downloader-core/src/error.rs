@@ -140,6 +140,13 @@ pub enum AppError {
         signal: &'static str,
     },
 
+    /// The download gate was closed while a batch was waiting for a permit.
+    ///
+    /// The gate belongs to the caller of the public download API; closing it
+    /// is a deliberate stop, not a transport or file failure.
+    #[error("download gate was closed; no further downloads can start")]
+    GateClosed,
+
     /// Tokio task join error.
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),

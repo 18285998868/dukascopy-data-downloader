@@ -42,7 +42,10 @@ pub struct DownloadStats {
 impl DownloadStats {
     /// Number of tasks whose outcome has been accounted for.
     pub(super) const fn done(&self) -> usize {
-        self.ok + self.not_found + self.failed + self.skipped
+        self.ok
+            .saturating_add(self.not_found)
+            .saturating_add(self.failed)
+            .saturating_add(self.skipped)
     }
 
     /// Whether the circuit breaker tripped during this batch.

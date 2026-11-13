@@ -9,12 +9,14 @@
 //! The domain types live next to this module: [`Symbol`], [`Timeframe`],
 //! [`PriceType`], [`DownloadTask`] and the date-range defaults.
 
+mod bucket;
 mod price_type;
 mod range;
 mod symbol;
 mod task;
 mod timeframe;
 
+pub use bucket::BucketKey;
 pub use price_type::PriceType;
 pub use range::{DEFAULT_START, MAX_RANGE_DAYS};
 pub use symbol::Symbol;
@@ -59,20 +61,6 @@ fn default_output_dir() -> PathBuf {
 
 fn default_concurrency() -> usize {
     30
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            symbol: Vec::new(),
-            timeframe: Vec::new(),
-            price_type: PriceType::Bid,
-            start: None,
-            end: None,
-            output_dir: default_output_dir(),
-            concurrency: default_concurrency(),
-        }
-    }
 }
 
 /// Upper bound for the shared download gate (also the client pool size).

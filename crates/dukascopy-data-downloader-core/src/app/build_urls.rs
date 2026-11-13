@@ -11,7 +11,7 @@
 use chrono::Datelike;
 use chrono::NaiveDate;
 
-use crate::config::{PriceType, Symbol, Timeframe};
+use crate::config::{BucketKey, PriceType, Symbol, Timeframe};
 
 /// Server-side base on the Dukascopy datafeed.
 ///
@@ -45,16 +45,19 @@ const LOCAL_PREFIX: &str = "dukascopy";
 
 /// A download URL paired with the local path that mirrors it.
 ///
-/// Symbol and timeframe are intentionally *not* stored here: every entry
-/// produced by a single [`build_urls`] call shares them, so the caller supplies
-/// them once when constructing a
-/// [`DownloadTask`](crate::config::DownloadTask).
+/// The symbol is intentionally *not* stored here: every entry produced by a
+/// single [`build_urls`] call shares it, so the caller supplies it once when
+/// constructing a [`DownloadTask`](crate::config::DownloadTask). The calendar
+/// bucket is stored because the missing-range analysis needs it later without
+/// re-parsing the destination path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadUrl {
     /// Fully-qualified server URL.
     pub url: String,
     /// `output_dir`-relative path mirroring the server path.
     pub rel_path: String,
+    /// Calendar bucket this file covers.
+    pub bucket: BucketKey,
 }
 
 /// Which calendar bucket a timeframe maps to: one file spans a year/month/day.
@@ -114,30 +117,25 @@ fn next_bucket(d: NaiveDate, period: PeriodKind, last: NaiveDate) -> Option<Naiv
     if d >= last {
         return None;
     }
-    Some(match period {
-        // Both bounds are years taken from real NaiveDates, so +1 stays in range.
-        PeriodKind::Year => {
-            NaiveDate::from_ymd_opt(d.year() + 1, 1, 1).expect("BUG: year step stays in range")
-        }
+    match period {
+        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year().checked_add(1)?, 1, 1),
         PeriodKind::Month => {
             let (y, m) = if d.month() == 12 {
-                (d.year() + 1, 1)
+                (d.year().checked_add(1)?, 1)
             } else {
                 (d.year(), d.month() + 1)
             };
-            NaiveDate::from_ymd_opt(y, m, 1).expect("BUG: month step stays in range")
+            NaiveDate::from_ymd_opt(y, m, 1)
         }
-        PeriodKind::Day => d.succ_opt()?,
-    })
+        PeriodKind::Day => d.succ_opt(),
+    }
 }
 
 /// Truncate `date` down to the start of its bucket and normalise `end` the same way.
 fn bucket_bounds(start: NaiveDate, end: NaiveDate, period: PeriodKind) -> (NaiveDate, NaiveDate) {
     let floor = |d: NaiveDate| match period {
-        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year(), 1, 1).expect("BUG: year is in range"),
-        PeriodKind::Month => {
-            NaiveDate::from_ymd_opt(d.year(), d.month(), 1).expect("BUG: month is in range")
-        }
+        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d),
+        PeriodKind::Month => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),
         PeriodKind::Day => d,
     };
     (floor(start), floor(end))
@@ -258,6 +256,7 @@ pub fn build_urls(
         DownloadUrl {
             url: format!("{FEED_BASE}/{path}"),
             rel_path: format!("{LOCAL_PREFIX}/{path}"),
+            bucket: BucketKey::new(tf, date),
         }
     })
 }
@@ -302,6 +301,7 @@ mod tests {
             vec![DownloadUrl {
                 url: format!("{FEED_BASE}/EURUSD/2025/BID_candles_day_1.bi5"),
                 rel_path: "dukascopy/EURUSD/2025/BID_candles_day_1.bi5".to_string(),
+                bucket: BucketKey::new(Timeframe::D1, date(2025, 1, 2)),
             }]
         );
     }

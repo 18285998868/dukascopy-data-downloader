@@ -57,7 +57,7 @@ pub fn build_download_tasks<S: std::hash::BuildHasher>(
             url: dl.url,
             dest: data_dir.join(&dl.rel_path),
             symbol: symbol.clone(),
-            timeframe,
+            bucket: dl.bucket,
         })
         .collect()
 }
@@ -109,7 +109,7 @@ mod tests {
         );
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].symbol, sym("EURUSD"));
-        assert_eq!(tasks[0].timeframe, Timeframe::D1);
+        assert_eq!(tasks[0].timeframe(), Timeframe::D1);
         assert_eq!(
             tasks[0].dest,
             Path::new("/tmp/dukascopy/EURUSD/2025/BID_candles_day_1.bi5")

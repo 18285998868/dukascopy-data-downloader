@@ -1,8 +1,9 @@
 //! The "requested range is not in the feed" verdict.
 
 use crate::AppError;
+use crate::config::BucketKey;
 
-use super::missing::{MissingBucket, longest_missing_run};
+use super::missing::longest_missing_run;
 use super::options::DownloadOptions;
 use super::stats::DownloadStats;
 
@@ -62,7 +63,7 @@ pub(super) fn cmp_ratio(part: usize, whole: usize, num: usize, den: usize) -> st
 ///   subject to any minimum sample size.
 pub(super) fn range_verdict(
     stats: DownloadStats,
-    missing_buckets: &[MissingBucket],
+    missing_buckets: &[BucketKey],
     opts: DownloadOptions,
 ) -> Result<(), AppError> {
     // A 404 is not a holiday: the feed publishes a file for every calendar

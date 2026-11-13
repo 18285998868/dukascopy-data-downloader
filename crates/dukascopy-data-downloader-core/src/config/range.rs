@@ -15,8 +15,13 @@ pub const MAX_RANGE_DAYS: i64 = 366 * 15;
 /// [`AppConfig::effective_range`] moves the default start forward to the
 /// earliest date that still fits and logs a warning. The default therefore
 /// keeps working after 2035 without silently expanding the range.
-pub const DEFAULT_START: chrono::NaiveDate =
-    chrono::NaiveDate::from_ymd_opt(2020, 1, 1).expect("2020-01-01 is a valid calendar date");
+pub const DEFAULT_START: chrono::NaiveDate = match chrono::NaiveDate::from_ymd_opt(2020, 1, 1) {
+    Some(date) => date,
+    // INVARIANT: 2020-01-01 is a valid calendar date. `NaiveDate::MIN`
+    // keeps the constant total without a panicking path the compiler
+    // cannot prove unreachable.
+    None => chrono::NaiveDate::MIN,
+};
 
 impl AppConfig {
     /// Resolve the download end date: `min(config.end, yesterday)`.
@@ -27,7 +32,8 @@ impl AppConfig {
     ///
     /// ```
     /// # use ddd::config::AppConfig;
-    /// let cfg = AppConfig::default();
+    /// let cfg: AppConfig =
+    ///     toml::from_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
     /// let today = chrono::NaiveDate::from_ymd_opt(2025, 3, 2).unwrap();
     ///
     /// // Without an explicit `end`, the range stops at yesterday.
@@ -65,7 +71,8 @@ impl AppConfig {
     ///
     /// ```
     /// # use ddd::config::AppConfig;
-    /// let cfg = AppConfig::default();
+    /// let cfg: AppConfig =
+    ///     toml::from_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
     /// let today = chrono::NaiveDate::from_ymd_opt(2025, 3, 2).unwrap();
     /// let (start, end) = cfg.effective_range(today).unwrap();
     /// assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());

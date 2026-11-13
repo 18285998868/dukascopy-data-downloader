@@ -9,9 +9,9 @@ use super::ratio::cmp_ratio;
 
 /// Number of recent attempts the breaker keeps in its sliding window.
 ///
-/// Must stay above [`super::run::MAX_REPORTED_FAILURES`]: the breaker caps how
-/// many files a pair may fail on, and a cap below the reason limit would make
-/// the limit unreachable.
+/// Must stay above `MAX_REPORTED_FAILURES`: the breaker caps how many files
+/// a pair may fail on, and a cap below the reason limit would make the limit
+/// unreachable.
 pub(super) const BREAKER_WINDOW: usize = 32;
 /// Failure ratio inside the window that opens the breaker: 1/2 = 50%.
 pub(super) const BREAKER_FAIL_NUM: usize = 1;
@@ -50,10 +50,13 @@ impl Breaker {
     /// `succeeded` is true for a download that worked *and* for a 404: a file
     /// the server does not have says nothing about the pair's reachability.
     pub(super) fn record(&self, succeeded: bool) -> bool {
-        let mut window = self
-            .window
-            .lock()
-            .expect("BUG: breaker mutex is not poisoned");
+        let mut window = self.window.lock().unwrap_or_else(|poisoned| {
+            // The window only holds booleans, so the data is still consistent
+            // after a panic in a previous holder. Recover it rather than
+            // turning a poisoned lock into a second panic.
+            tracing::warn!("breaker window mutex was poisoned; recovering its contents");
+            poisoned.into_inner()
+        });
         if window.len() == BREAKER_WINDOW {
             window.pop_front();
         }

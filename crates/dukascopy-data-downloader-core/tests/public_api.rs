@@ -9,10 +9,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ddd::config::{AppConfig, PriceType, Symbol, Timeframe};
+use ddd::config::{AppConfig, BucketKey, PriceType, Symbol, Timeframe};
 use ddd::utils::scan_local_files::scan_local_files;
 
 /// Write `body` into a fresh temp directory and return the config path.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test fixture: failing to set up the temp directory aborts the test"
+)]
 fn write_config(body: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
@@ -21,6 +25,10 @@ fn write_config(body: &str) -> (tempfile::TempDir, PathBuf) {
 }
 
 /// 2025-06-15, the single day used by the expansion tests.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test fixture: the date is a fixed valid calendar date"
+)]
 fn day() -> chrono::NaiveDate {
     chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap()
 }
@@ -80,7 +88,7 @@ fn urls_destinations_and_task_metadata_stay_in_sync() {
         Path::new("/out/dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5")
     );
     assert_eq!(task.symbol.as_str(), "EURUSD");
-    assert_eq!(task.timeframe, Timeframe::H1);
+    assert_eq!(task.timeframe(), Timeframe::H1);
 }
 
 /// The cache is a *file*-level contract: the scanner and the task builder
@@ -190,7 +198,10 @@ async fn a_mixed_timeframe_batch_is_analysed_per_timeframe() {
                 .path()
                 .join(format!("dukascopy/EURUSD/{year}/BID_candles_day_1.bi5")),
             symbol: ddd::Symbol::new("EURUSD").unwrap(),
-            timeframe: ddd::Timeframe::D1,
+            bucket: BucketKey::new(
+                ddd::Timeframe::D1,
+                chrono::NaiveDate::from_ymd_opt(year, 1, 1).unwrap(),
+            ),
         });
     }
     // An M1 bucket that sorts *between* two of the years.
@@ -200,7 +211,10 @@ async fn a_mixed_timeframe_batch_is_analysed_per_timeframe() {
             .path()
             .join("dukascopy/EURUSD/2023/06/15/BID_candles_min_1.bi5"),
         symbol: ddd::Symbol::new("EURUSD").unwrap(),
-        timeframe: ddd::Timeframe::M1,
+        bucket: BucketKey::new(
+            ddd::Timeframe::M1,
+            chrono::NaiveDate::from_ymd_opt(2023, 6, 15).unwrap(),
+        ),
     });
 
     let gate = Arc::new(tokio::sync::Semaphore::new(4));

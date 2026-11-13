@@ -6,10 +6,10 @@
 //! 2. [`build_download_tasks`] — drop locally cached files and bind destinations.
 //! 3. [`download`] — stream the remaining tasks with bounded concurrency.
 //!
-//! All symbol x timeframe pairs run **concurrently** ([`tokio::task::JoinSet`]),
-//! but they share a single download gate, so `concurrency` bounds in-flight
-//! requests across the whole run. A failing pair is recorded and does not abort
-//! the others.
+//! All symbol x timeframe pairs run through a [`tokio::task::JoinSet`], at
+//! most `MAX_CONCURRENT_PAIRS` at a time, and they share a single download
+//! gate, so `concurrency` bounds in-flight requests across the whole run. A
+//! failing pair is recorded and does not abort the others.
 
 pub mod build_download_tasks;
 pub mod build_urls;
@@ -34,6 +34,13 @@ use signal::termination_signal;
 
 /// Maximum number of pair-level error details retained in the batch summary.
 const MAX_BATCH_ERRORS: usize = 20;
+/// Maximum number of symbol x timeframe pairs in flight at once.
+///
+/// The shared download gate already bounds in-flight requests; this bound
+/// keeps a large symbol x timeframe matrix from allocating one task and one
+/// task list per pair up front. Completed pairs release their slot while the
+/// remaining pairs are still being scheduled.
+const MAX_CONCURRENT_PAIRS: usize = 32;
 
 /// Run the full batch download pipeline.
 ///
@@ -95,6 +102,18 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
 /// # }
 /// ```
 pub async fn run_with(config_path: &Path, opts: &DownloadOptions) -> Result<(), AppError> {
+    run_with_today(config_path, opts, chrono::Utc::now().date_naive()).await
+}
+
+/// [`run_with`] with an explicit current date.
+///
+/// `today` is injected so tests can pin the boundary between finished and
+/// unfinished buckets; production passes the current UTC date.
+async fn run_with_today(
+    config_path: &Path,
+    opts: &DownloadOptions,
+    today: chrono::NaiveDate,
+) -> Result<(), AppError> {
     // Install the OS handlers for the termination signals *first*: the
     // handler has to be in place before the run lock is taken. Otherwise a
     // Ctrl+C during start-up would kill the process with the default
@@ -124,7 +143,7 @@ pub async fn run_with(config_path: &Path, opts: &DownloadOptions) -> Result<(), 
     // is dropped immediately, so no lock is leaked either way.
     tokio::select! {
         biased;
-        result = run_pipeline(cfg, opts, lock) => result,
+        result = run_pipeline(cfg, opts, lock, today) => result,
         signal = termination => Err(AppError::Interrupted { signal }),
     }
 }
@@ -138,10 +157,10 @@ async fn run_pipeline(
     cfg: AppConfig,
     opts: &DownloadOptions,
     _lock: crate::utils::run_lock::RunLock,
+    today: chrono::NaiveDate,
 ) -> Result<(), AppError> {
     // Resolve the range *before* any I/O: it is pure arithmetic, so a
     // misconfigured range costs nothing instead of a full disk scan.
-    let today = chrono::Utc::now().date_naive();
     let (start, end) = cfg.effective_range(today)?;
 
     // A reversed range means every pair would be skipped anyway, so bail out
@@ -188,13 +207,25 @@ async fn run_pipeline(
     };
 
     let mut pairs = JoinSet::new();
+    let pair_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAIRS));
     // Borrow the config through its `Arc` instead of cloning the vectors out
     // of it: `Vec<Symbol>` is a `Vec<String>`, so cloning it would allocate
     // one `String` per symbol for no reason.
     let cfg = Arc::clone(&shared.cfg);
-    for symbol in &cfg.symbol {
+    'schedule: for symbol in &cfg.symbol {
         for timeframe in &cfg.timeframe {
-            pairs.spawn(run_pair(shared.clone(), symbol.clone(), *timeframe));
+            let symbol = symbol.clone();
+            let timeframe = *timeframe;
+            let shared = shared.clone();
+            let Ok(permit) = Arc::clone(&pair_limit).acquire_owned().await else {
+                // The semaphore is never closed; treat an unexpected closure
+                // as "stop scheduling" instead of panicking.
+                break 'schedule;
+            };
+            pairs.spawn(async move {
+                let _permit = permit;
+                run_pair(shared, symbol, timeframe).await
+            });
         }
     }
 
@@ -287,8 +318,13 @@ fn describe_join_error(err: tokio::task::JoinError) -> JoinFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
     use std::path::PathBuf;
+
+    /// A fixed "current day" so bucket-boundary tests never depend on the
+    /// wall clock.
+    fn today() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2025, 6, 15).expect("valid fixed date")
+    }
 
     /// Write a config whose `output_dir` is the temp dir, and pre-create the
     /// cache file `rel` inside it.
@@ -371,7 +407,9 @@ mod tests {
             "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"2025-01-01\"\nend = \"2025-01-01\"",
             "dukascopy/EURUSD/2025/BID_candles_day_1.bi5",
         );
-        run(&path).await.unwrap();
+        run_with_today(&path, &DownloadOptions::default(), today())
+            .await
+            .unwrap();
     }
 
     /// A start date beyond `today` yields a reversed effective range; the pair
@@ -381,30 +419,31 @@ mod tests {
         let (_dir, path) = config(
             "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"2999-01-01\"\nend = \"2999-12-31\"\n",
         );
-        run(&path).await.unwrap();
+        run_with_today(&path, &DownloadOptions::default(), today())
+            .await
+            .unwrap();
     }
 
     /// A D1 range inside the current year has no finished bucket yet: the
     /// year file is still being written, so nothing is requested.
     #[tokio::test]
     async fn run_skips_a_year_bucket_that_is_still_open() {
-        let today = chrono::Utc::now().date_naive();
-        let year = today.year();
-        let (_dir, path) = config(&format!(
-            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"{year}-01-01\"\nend = \"{year}-06-30\"\n"
-        ));
-        run(&path).await.unwrap();
+        let (_dir, path) = config(
+            "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"2025-01-01\"\nend = \"2025-06-30\"\n",
+        );
+        run_with_today(&path, &DownloadOptions::default(), today())
+            .await
+            .unwrap();
     }
 
     /// The same for the H1 file of the month that is still running.
     #[tokio::test]
     async fn run_skips_a_month_bucket_that_is_still_open() {
-        let today = chrono::Utc::now().date_naive();
-        let first_of_month = today.with_day(1).unwrap();
-        let (_dir, path) = config(&format!(
-            "symbol = [\"EURUSD\"]\ntimeframe = [\"H1\"]\nstart = \"{first_of_month}\"\n"
-        ));
-        run(&path).await.unwrap();
+        let (_dir, path) =
+            config("symbol = [\"EURUSD\"]\ntimeframe = [\"H1\"]\nstart = \"2025-06-01\"\n");
+        run_with_today(&path, &DownloadOptions::default(), today())
+            .await
+            .unwrap();
     }
 
     // — join-error reporting —

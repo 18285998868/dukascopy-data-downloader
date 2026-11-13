@@ -29,6 +29,6 @@ pub mod utils;
 pub use app::download::DownloadOptions;
 pub use app::run;
 pub use config::{
-    AppConfig, DEFAULT_START, DownloadTask, MAX_RANGE_DAYS, PriceType, Symbol, Timeframe,
+    AppConfig, BucketKey, DEFAULT_START, DownloadTask, MAX_RANGE_DAYS, PriceType, Symbol, Timeframe,
 };
 pub use error::AppError;

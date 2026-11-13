@@ -29,15 +29,19 @@ use crate::utils::backoff::{Retry, RetryError, default_retry};
 ///
 /// ```no_run
 /// # use std::path::PathBuf;
-/// # use ddd::config::{DownloadTask, Symbol, Timeframe};
+/// # use ddd::config::{BucketKey, DownloadTask, Symbol, Timeframe};
 /// # async fn example() -> Result<(), ddd::AppError> {
 /// let client = reqwest::Client::new();
+/// let bucket = BucketKey::new(
+///     Timeframe::D1,
+///     chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+/// );
 /// let task = DownloadTask {
 ///     url: "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/BID_candles_day_1.bi5"
 ///         .to_string(),
 ///     dest: PathBuf::from("/tmp/dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),
 ///     symbol: Symbol::new("EURUSD")?,
-///     timeframe: Timeframe::D1,
+///     bucket,
 /// };
 ///
 /// ddd::app::download::stream::download_to_file(&client, &task).await
@@ -285,7 +289,7 @@ async fn download_to_file_with_backoff(
 mod tests {
     use super::*;
     use crate::AppError;
-    use crate::config::{Symbol, Timeframe};
+    use crate::config::{BucketKey, Symbol, Timeframe};
     use crate::utils::backoff::{RetryPolicy, default_policy};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -325,7 +329,10 @@ mod tests {
             url: format!("{}{URL_PATH}", server.uri()),
             dest: dest.to_path_buf(),
             symbol: Symbol::new("EURUSD").unwrap(),
-            timeframe: Timeframe::D1,
+            bucket: BucketKey::new(
+                Timeframe::D1,
+                chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            ),
         }
     }
 

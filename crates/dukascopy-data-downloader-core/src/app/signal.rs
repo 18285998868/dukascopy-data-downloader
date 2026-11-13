@@ -31,10 +31,19 @@ pub(super) fn termination_signal() -> impl Future<Output = &'static str> {
                     let _ = interrupt.recv().await;
                     "SIGINT"
                 }
-                (Err(e), _) => {
+                (Err(e), Ok(mut terminate)) => {
                     tracing::warn!(
                         error = %e,
-                        "could not install the SIGINT handler; the run cannot be interrupted cleanly"
+                        "could not install the SIGINT handler; SIGTERM still works"
+                    );
+                    let _ = terminate.recv().await;
+                    "SIGTERM"
+                }
+                (Err(interrupt_err), Err(terminate_err)) => {
+                    tracing::warn!(
+                        interrupt_error = %interrupt_err,
+                        terminate_error = %terminate_err,
+                        "could not install any termination handler; the run cannot be interrupted cleanly"
                     );
                     // Nothing to wait for: park forever so this branch of
                     // the outer select never wins.

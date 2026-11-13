@@ -15,12 +15,11 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use crate::AppError;
-use crate::config::DownloadTask;
+use crate::config::{BucketKey, DownloadTask};
 
 use super::breaker::{
     BREAKER_FAIL_DEN, BREAKER_FAIL_NUM, BREAKER_WINDOW, Breaker, is_transport_failure,
 };
-use super::missing::{MissingBucket, bucket_key, bucket_position};
 use super::options::DownloadOptions;
 use super::ratio::range_verdict;
 use super::stats::DownloadStats;
@@ -40,7 +39,7 @@ enum TaskOutcome {
     /// missing for.
     NotFound {
         /// Calendar slot the file was missing from.
-        bucket: MissingBucket,
+        bucket: BucketKey,
     },
     /// Failed for any other reason.
     Failed(AppError),
@@ -198,9 +197,13 @@ where
 {
     let total = tasks.len();
     let concurrency = concurrency.max(1);
-    if total == 0 {
+    let mut tasks = tasks.into_iter();
+
+    // — probe —
+    // An empty batch is a no-op that still yields usable statistics.
+    let Some(probe) = tasks.next() else {
         return Ok(DownloadStats::default());
-    }
+    };
     tracing::debug!(total, concurrency, "downloading files");
 
     let mut stats = DownloadStats {
@@ -208,14 +211,8 @@ where
         ..DownloadStats::default()
     };
     let mut reasons: Vec<String> = Vec::with_capacity(MAX_REPORTED_FAILURES);
-    let mut missing_buckets: Vec<MissingBucket> = Vec::new();
+    let mut missing_buckets: Vec<BucketKey> = Vec::new();
     let breaker = Breaker::new();
-
-    let mut tasks = tasks.into_iter();
-
-    // — probe —
-    // `total > 0` is checked above, so there is a first task.
-    let probe = tasks.next().expect("total > 0");
     let outcome = run_one_task(client, gate, &breaker, &download_fn, probe).await;
     let endpoint_unreachable =
         matches!(&outcome, TaskOutcome::Failed(err) if is_transport_failure(err));
@@ -273,23 +270,23 @@ fn record_outcome(
     outcome: TaskOutcome,
     stats: &mut DownloadStats,
     reasons: &mut Vec<String>,
-    missing_buckets: &mut Vec<MissingBucket>,
+    missing_buckets: &mut Vec<BucketKey>,
 ) {
     match outcome {
-        TaskOutcome::Ok => stats.ok += 1,
+        TaskOutcome::Ok => stats.ok = stats.ok.saturating_add(1),
         TaskOutcome::NotFound { bucket } => {
-            stats.not_found += 1;
+            stats.not_found = stats.not_found.saturating_add(1);
             missing_buckets.push(bucket);
         }
         TaskOutcome::Failed(err) => {
-            stats.failed += 1;
+            stats.failed = stats.failed.saturating_add(1);
             if reasons.len() < MAX_REPORTED_FAILURES {
                 reasons.push(err.chain());
             } else {
                 tracing::debug!(error = %err.chain(), "download failed (detail not retained)");
             }
         }
-        TaskOutcome::Skipped => stats.skipped += 1,
+        TaskOutcome::Skipped => stats.skipped = stats.skipped.saturating_add(1),
     }
 }
 
@@ -302,7 +299,7 @@ fn record_outcome(
 fn finalize_batch(
     stats: DownloadStats,
     reasons: Vec<String>,
-    missing_buckets: &[MissingBucket],
+    missing_buckets: &[BucketKey],
     opts: DownloadOptions,
 ) -> Result<DownloadStats, AppError> {
     if stats.not_found > 0 {
@@ -357,22 +354,20 @@ where
     F: Fn(reqwest::Client, DownloadTask) -> Fut,
     Fut: Future<Output = Result<(), AppError>>,
 {
-    let span = tracing::info_span!("download", symbol = %task.symbol, tf = %task.timeframe);
+    let span = tracing::info_span!("download", symbol = %task.symbol, tf = %task.timeframe());
     async {
         if breaker.is_open() {
             return TaskOutcome::Skipped;
         }
-        // `download_fn` consumes the task, but a 404 needs the bucket it
-        // belonged to. Cloning just the destination is one allocation;
-        // building the full key for every task — including the ones that
-        // succeed — costs six.
-        let dest = task.dest.clone();
-        let timeframe = task.timeframe;
-        // The gate is never closed, so acquiring can only fail on a bug.
-        let _permit = gate
-            .acquire()
-            .await
-            .expect("BUG: download gate is never closed");
+        // A 404 needs the bucket the task belonged to, and the bucket is
+        // carried by the task itself — no re-parsing of the destination path.
+        let bucket = task.bucket;
+        // The gate is normally never closed; a caller can close it through the
+        // public API, so that case becomes a structured failure instead of a
+        // panic.
+        let Ok(_permit) = gate.acquire().await else {
+            return TaskOutcome::Failed(AppError::GateClosed);
+        };
         match download_fn(client.clone(), task).await {
             Ok(()) => {
                 breaker.record(true);
@@ -382,19 +377,6 @@ where
                 // A file the server does not have says nothing about whether
                 // the pair is reachable, so it must not count as a failure.
                 breaker.record(true);
-                let bucket = bucket_key(&dest, timeframe);
-                if bucket_position(&bucket.key, bucket.timeframe).is_none() {
-                    // The destination does not mirror the server layout, so
-                    // the missing-range analysis cannot place this file on
-                    // the calendar. Say so instead of quietly mis-measuring
-                    // the gap.
-                    tracing::warn!(
-                        bucket = %bucket.key,
-                        timeframe = ?bucket.timeframe,
-                        "the missing file's destination does not mirror the server layout; \
-                         the missing-range analysis cannot place it on the calendar",
-                    );
-                }
                 TaskOutcome::NotFound { bucket }
             }
             Err(err) => {
@@ -420,7 +402,10 @@ mod tests {
             url: format!("http://example.com/{symbol}/{tag}"),
             dest: std::path::PathBuf::from("/tmp"),
             symbol: Symbol::new(symbol).unwrap(),
-            timeframe: Timeframe::D1,
+            bucket: BucketKey::new(
+                Timeframe::D1,
+                chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            ),
         }
     }
 
@@ -430,7 +415,10 @@ mod tests {
             url: format!("http://example.com/EURUSD/{tag}"),
             dest: std::path::PathBuf::from(dest),
             symbol: Symbol::new("EURUSD").unwrap(),
-            timeframe,
+            bucket: BucketKey::new(
+                timeframe,
+                chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            ),
         }
     }
 
@@ -444,7 +432,7 @@ mod tests {
         (0..n)
             .map(|i| {
                 let day = start + chrono::Duration::days(i64::try_from(i).expect("n fits in i64"));
-                task_for(
+                let mut task = task_for(
                     Timeframe::M1,
                     &format!(
                         "/tmp/dukascopy/EURUSD/{}/{:02}/{:02}/BID_candles_min_1.bi5",
@@ -453,7 +441,9 @@ mod tests {
                         day.day()
                     ),
                     &i.to_string(),
-                )
+                );
+                task.bucket = BucketKey::new(Timeframe::M1, day);
+                task
             })
             .collect()
     }

@@ -9,19 +9,26 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ddd::config::{DownloadTask, Symbol, Timeframe};
+use ddd::config::{BucketKey, DownloadTask, Symbol, Timeframe};
 use tokio::sync::Semaphore;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const URL_PATH: &str = "/datafeed/EURUSD/2025/06/BID_candles_hour_1.bi5";
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "test fixture: the symbol and date are fixed valid values"
+)]
 fn task(server: &MockServer, dest: PathBuf) -> DownloadTask {
     DownloadTask {
         url: format!("{}{URL_PATH}", server.uri()),
         dest,
         symbol: Symbol::new("EURUSD").unwrap(),
-        timeframe: Timeframe::H1,
+        bucket: BucketKey::new(
+            Timeframe::H1,
+            chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+        ),
     }
 }
 
@@ -141,7 +148,10 @@ async fn a_batch_mixes_success_and_not_found() {
         url: format!("{}/{name}", server.uri()),
         dest: dir.path().join(name),
         symbol: Symbol::new("EURUSD").unwrap(),
-        timeframe: Timeframe::H1,
+        bucket: BucketKey::new(
+            Timeframe::H1,
+            chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+        ),
     };
     let tasks = vec![make("ok.bi5"), make("missing.bi5")];
 
