@@ -29,19 +29,19 @@ output_dir=/data  →  /data/dukascopy/{symbol}/{YYYY}[/{MM}[/{DD}]]/{PRICE}_can
 
 ```bash
 # 1) 复制并编辑配置
-cp config.example.toml config.toml
+cp config/00.example.toml config.toml
 
 # 2) 运行
-cargo run --release -- -c config.toml
+cargo run --release -p dukascopy-data-downloader-cli -- -c config.toml
 
 # 3) 增量更新（再次运行同一命令即可，已存在的文件会被跳过）
-cargo run --release -- -c config.toml
+cargo run --release -p dukascopy-data-downloader-cli -- -c config.toml
 ```
 
 日志由 `RUST_LOG` 控制，缺省 `info`：
 
 ```bash
-RUST_LOG=debug cargo run --release -- -c config.toml
+RUST_LOG=debug cargo run --release -p dukascopy-data-downloader-cli -- -c config.toml
 ```
 
 ### 命令行参数
@@ -76,7 +76,7 @@ Options:
 
 ## 配置
 
-完整字段说明见 `config.example.toml`，冒烟配置见 `config.test.toml`。
+完整字段说明见 `config/00.example.toml`，冒烟配置见 `config/00.smoke.toml`。
 
 | 字段 | 类型 | 必填 | 缺省 | 说明 |
 |---|---|---|---|---|
@@ -404,7 +404,7 @@ cargo fmt --all -- --check
 cargo doc --no-deps     # 公开 API 文档（无断链）
 
 # 冒烟：真实下载 1 个品种 × D1 × 2025 年，输出到 /tmp
-cargo run --release -- -c config.test.toml
+cargo run --release -p dukascopy-data-downloader-cli -- -c config/00.smoke.toml
 ```
 
 单元测试（`src/` 内 `#[cfg(test)]` 模块）覆盖范围：

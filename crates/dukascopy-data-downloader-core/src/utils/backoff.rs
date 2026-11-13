@@ -8,11 +8,11 @@
 //!
 //! Backon's schedule alone cannot express that: `total_delay` only counts the
 //! sleeps it schedules, so a slow attempt (or a server-provided wait) would
-//! not shorten the window. [`Retry::run`] therefore clamps every scheduled
+//! not shorten the window. `Retry::run` therefore clamps every scheduled
 //! delay to the remaining budget and stops once the deadline has passed.
 //!
 //! A `Retry-After` hint is spent by the *operation*, not handed to the retry
-//! loop: the operation sleeps it before returning [`RetryError::Transient`],
+//! loop: the operation sleeps it before returning `RetryError::Transient`,
 //! so the hint is charged to the deadline and the exponential schedule stays
 //! in charge of the next attempt.
 

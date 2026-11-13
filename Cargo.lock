@@ -330,13 +330,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "dukascopy-data-downloader"
+name = "dukascopy-data-downloader-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dukascopy-data-downloader-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dukascopy-data-downloader-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "backon",
  "chrono",
- "clap",
  "futures",
  "reqwest",
  "serde",
@@ -345,7 +356,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
  "walkdir",
  "wiremock",
 ]

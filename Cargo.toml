@@ -1,49 +1,16 @@
 [workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/dukascopy-data-downloader-cli"]
 
-# Lint policy lives here so it applies to *every* target: the library, the
-# binary and the integration tests. Crate-level `#![...]` attributes only
-# cover the crate that declares them, which used to leave `src/main.rs`
-# unconstrained.
-[workspace.lints.rust]
-missing_docs = "warn"
-missing_debug_implementations = "warn"
-# The crate is `safe` end to end: the run lock deliberately avoids `flock`
-# (and with it a C dependency) by using an atomic `create_dir`. Declaring
-# `unsafe_code` keeps it that way — a new `unsafe` block has to be an
-# explicit, reviewable decision instead of slipping in unnoticed.
-unsafe_code = "warn"
-
-[workspace.lints.clippy]
-correctness = "deny"
-suspicious = "warn"
-style = "warn"
-complexity = "warn"
-perf = "warn"
-# `pedantic` catches the class of defects the other groups miss: public
-# items that should be `#[must_use]`, doc comments whose identifiers are
-# not marked as code, float casts that lose precision, and functions that
-# grew past the point of being reviewable.
-pedantic = "warn"
-
-[package]
-name = "dukascopy-data-downloader"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Download raw Dukascopy historical kline (.bi5) files from the public Datafeed."
 license = "MIT"
 
-[lints]
-workspace = true
-
-[lib]
-name = "ddd"
-
-[dependencies]
+[workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
-# Narrow feature set: rt-multi-thread (#[tokio::main]), macros (#[tokio::test]),
-# fs (tokio::fs), time (test sleeps), sync (Semaphore download gate),
-# signal (SIGINT/SIGTERM handling so an interrupted run releases its lock).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "signal"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 futures = "0.3"
@@ -55,17 +22,20 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 anyhow = "1"
-# Retry scheduling: backon supplies the exponential schedule and Tokio sleep
-# integration; `src/utils/backoff.rs` adds the absolute wall-clock deadline.
 backon = { version = "1.6", default-features = false, features = ["std", "tokio-sleep"] }
 
-[dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
-opt-level = 3
-incremental = false
-strip = "symbols"
+[workspace.lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
+pedantic = "warn"

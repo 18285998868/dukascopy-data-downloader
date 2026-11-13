@@ -1,0 +1,22 @@
+[package]
+name = "dukascopy-data-downloader-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for the Dukascopy data downloader."
+license.workspace = true
+
+[[bin]]
+name = "dukascopy-data-downloader"
+path = "src/main.rs"
+
+[dependencies]
+ddd = { package = "dukascopy-data-downloader-core", path = "../dukascopy-data-downloader-core" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

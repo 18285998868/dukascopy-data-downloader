@@ -3,6 +3,8 @@
 //! Initializes tracing, parses command-line arguments, then runs the
 //! full download pipeline with the provided TOML configuration.
 
+mod cli;
+
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
@@ -16,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Parse command-line arguments (`--config`/`-c` is required).
-    let cli = ddd::cli::parse();
+    let cli = cli::parse();
 
     // Run the download pipeline, annotating any error with pipeline context.
     let opts = ddd::app::download::DownloadOptions {
