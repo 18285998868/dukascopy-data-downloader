@@ -3,45 +3,65 @@
 # TIME: 2026-11-13
 # DOC: 本地与 CI 共用的 Rust 门禁脚本
 # LOGIC:
-#   STEP 1: 解析参数 (--ci 使用 --locked)
-#   STEP 2: 依次运行 fmt/check/clippy/test/doc/bench
+#   STEP 1: 定位仓库根目录并解析 --ci
+#   STEP 2: 依次运行 fmt/check/clippy/test/doctest/doc/bench
+#   STEP 3: 运行 cargo-deny 与 cargo-audit; 未安装时 CI 失败, 本地警告
 # USAGE:
 #   ./scripts/check.sh [--ci]
 
 set -Eeuo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-CI=false
-if [[ ${1:-} == "--ci" ]]; then
-    CI=true
+ci=false
+if [[ ${1:-} == --ci ]]; then
+    ci=true
 fi
 
-LOCKED=()
-if $CI; then
-    LOCKED=(--locked)
+locked=()
+if $ci; then
+    locked=(--locked)
 fi
 
-echo "==> cargo fmt"
-cargo fmt --all -- --check
+run() {
+    printf '==> %s\n' "$*"
+    "$@"
+}
 
-echo "==> cargo check"
-cargo check --workspace --all-targets "${LOCKED[@]}"
+run cargo fmt --all -- --check
+run cargo check --workspace --all-targets "${locked[@]}"
+run cargo clippy --workspace --all-targets --all-features "${locked[@]}" -- -D warnings
+run cargo clippy --workspace --all-targets --no-default-features "${locked[@]}" -- -D warnings
 
-echo "==> cargo clippy (all features)"
-cargo clippy --workspace --all-targets --all-features "${LOCKED[@]}" -- -D warnings
+if cargo nextest --version >/dev/null 2>&1; then
+    run cargo nextest run --workspace --all-features "${locked[@]}"
+else
+    printf '==> cargo nextest not installed; falling back to cargo test\n'
+    run cargo test --workspace --all-features "${locked[@]}"
+fi
 
-echo "==> cargo clippy (no default features)"
-cargo clippy --workspace --all-targets --no-default-features "${LOCKED[@]}" -- -D warnings
+run cargo test --workspace --doc --all-features "${locked[@]}"
 
-echo "==> cargo test"
-cargo nextest run --workspace --all-features "${LOCKED[@]}" 2>/dev/null || cargo test --workspace --all-features "${LOCKED[@]}"
+printf '==> cargo doc\n'
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features "${locked[@]}"
 
-echo "==> cargo test --doc"
-cargo test --workspace --doc --all-features "${LOCKED[@]}"
+run cargo bench --workspace --no-run "${locked[@]}"
 
-echo "==> cargo doc"
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features "${LOCKED[@]}"
+missing=0
+for tool in cargo-deny cargo-audit; do
+    if ! command -v -- "$tool" >/dev/null 2>&1; then
+        printf 'missing tool: %s\n' "$tool" >&2
+        missing=1
+    fi
+done
+if ((missing)); then
+    if $ci; then
+        printf 'CI requires cargo-deny and cargo-audit\n' >&2
+        exit 1
+    fi
+    printf 'SKIP: cargo-deny/cargo-audit (install them for the complete gate)\n' >&2
+else
+    run cargo deny check
+    run cargo audit
+fi
 
-echo "==> cargo bench (compile only)"
-cargo bench --workspace --no-run "${LOCKED[@]}"
-
-echo "ALL GATES PASSED"
+printf 'ALL GATES PASSED\n'

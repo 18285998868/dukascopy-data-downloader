@@ -13,4 +13,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny,cargo-audit
       - run: ./scripts/check.sh --ci
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      # Dev-dependencies (wiremock) use let-chains and need a newer compiler;
+      # the MSRV contract covers the shipped library and binary.
+      - run: cargo check --workspace --all-features --locked

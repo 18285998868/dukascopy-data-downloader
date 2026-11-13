@@ -336,6 +336,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dukascopy-data-downloader-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
