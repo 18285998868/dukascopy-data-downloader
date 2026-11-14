@@ -66,7 +66,7 @@ output_dir=/data  →  /data/dukascopy/{symbol}/{YYYY}[/{MM}[/{DD}]]/{PRICE}_can
 ./scripts/check.sh --ci     # CI 模式：--locked，且要求 cargo-deny/cargo-audit
 ```
 
-当前覆盖：213 个单元测试、18 个集成测试、17 个 doctest。
+当前覆盖：221 个单元测试、18 个集成测试、22 个 doctest。
 
 冒烟下载（真实网络，输出到 `/tmp/dukascopy-smoke`）：
 

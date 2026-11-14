@@ -62,6 +62,7 @@ GET → 校验状态码 → 建父目录 → 删残留 .bi5.tmp
 |---|---|
 | `Http` / `Io` / `FileIo` | 传输、文件系统错误 |
 | `Config` | 配置读取、解析、校验失败 |
+| `RunLocked` | 同一 `output_dir` 已有实例持锁 |
 | `DownloadFailed` | 单文件重试预算耗尽 |
 | `NotFound` | HTTP 404 |
 | `BatchFailed` | 单 pair 内文件失败 |
