@@ -7,10 +7,9 @@
 //! policy can be injected.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use ddd::config::{BucketKey, DownloadTask, Symbol, Timeframe};
-use tokio::sync::Semaphore;
+use ddd::config::{BucketKey, Symbol, Timeframe};
+use ddd::{DownloadGate, DownloadTask};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -21,15 +20,15 @@ const URL_PATH: &str = "/datafeed/EURUSD/2025/06/BID_candles_hour_1.bi5";
     reason = "test fixture: the symbol and date are fixed valid values"
 )]
 fn task(server: &MockServer, dest: PathBuf) -> DownloadTask {
-    DownloadTask {
-        url: format!("{}{URL_PATH}", server.uri()),
+    DownloadTask::new(
+        format!("{}{URL_PATH}", server.uri()),
         dest,
-        symbol: Symbol::new("EURUSD").unwrap(),
-        bucket: BucketKey::new(
+        Symbol::new("EURUSD").unwrap(),
+        BucketKey::new(
             Timeframe::H1,
             chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
         ),
-    }
+    )
 }
 
 /// The scratch file a download writes before its atomic rename.
@@ -96,8 +95,8 @@ async fn a_batch_of_only_404s_is_an_unavailable_range() {
     let dir = tempfile::tempdir().unwrap();
     let tasks = vec![task(&server, dir.path().join("a/BID_candles_hour_1.bi5"))];
 
-    let gate = Arc::new(Semaphore::new(4));
-    let err = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, 4, &gate)
+    let gate = DownloadGate::new(std::num::NonZeroUsize::new(4).unwrap());
+    let err = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, &gate)
         .await
         .unwrap_err();
 
@@ -144,24 +143,26 @@ async fn a_batch_mixes_success_and_not_found() {
         .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let make = |name: &str| DownloadTask {
-        url: format!("{}/{name}", server.uri()),
-        dest: dir.path().join(name),
-        symbol: Symbol::new("EURUSD").unwrap(),
-        bucket: BucketKey::new(
-            Timeframe::H1,
-            chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
-        ),
+    let make = |name: &str| {
+        DownloadTask::new(
+            format!("{}/{name}", server.uri()),
+            dir.path().join(name),
+            Symbol::new("EURUSD").unwrap(),
+            BucketKey::new(
+                Timeframe::H1,
+                chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            ),
+        )
     };
     let tasks = vec![make("ok.bi5"), make("missing.bi5")];
 
-    let gate = Arc::new(Semaphore::new(4));
-    let stats = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, 4, &gate)
+    let gate = DownloadGate::new(std::num::NonZeroUsize::new(4).unwrap());
+    let stats = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, &gate)
         .await
         .unwrap();
 
-    assert_eq!(stats.ok, 1);
-    assert_eq!(stats.not_found, 1);
-    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.ok(), 1);
+    assert_eq!(stats.not_found(), 1);
+    assert_eq!(stats.failed(), 0);
     assert_eq!(std::fs::read(dir.path().join("ok.bi5")).unwrap(), b"ok");
 }

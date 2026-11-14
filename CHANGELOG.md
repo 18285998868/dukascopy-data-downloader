@@ -2,6 +2,36 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [Unreleased]
+
+### Changed
+
+- 日历统一到 `BucketKey`：`BucketKey::end()` / `next()`、`buckets_between`、`last_closed_day` 成为唯一日历来源；`build_urls` 只负责渲染 URL 与本地路径。
+- `AppConfig` 字段私有，新增 `symbols()` / `timeframes()` / `price_type()` / `start()` / `end()` / `output_dir()` / `concurrency()`（`NonZeroUsize`）与 `from_toml_str`；反序列化改由私有 `RawConfig` 承担，校验集中在 `TryFrom`。
+- `DownloadTask` 迁到 `app::download`：字段私有，使用 `DownloadTask::new` 与读取器，并标记 `#[non_exhaustive]`。
+- `DownloadGate` 取代 `(concurrency, &Arc<Semaphore>)`：`run_downloads` / `run_downloads_with` 只接收 `&DownloadGate`，上限与许可池不可能不一致。
+- `DownloadOptions` 字段私有，使用 `new()` / `with_allow_missing()` / `allow_missing()`；结构体标记 `#[non_exhaustive]`。
+- `DownloadStats` 计数私有，通过读取器访问，只由下载流水线构造。
+- `utils` 模块退场：缓存扫描移到 `app::cache`（crate 根仍可 `ddd::scan_local_files`），运行锁移到 `app::lock`，重试策略移到 `app::download::retry`。
+- crate 根部统一 re-export：`DownloadGate`、`DownloadOptions`、`DownloadStats`、`DownloadTask`、`run` / `run_with`、`scan_local_files` 与配置类型。
+- CLI 的 tracing 初始化改用 `try_init()`，重复初始化返回错误而不是 panic。
+
+### Removed
+
+- `ddd::utils` 模块与 `ddd::config::DownloadTask` 路径。
+- `AppConfig` 的公开字段；`concurrency` 由 `usize` 改为 `NonZeroUsize`。
+- `DownloadStats` 的公开字段与结构体字面量构造。
+- core crate 的 `anyhow` 依赖。
+
+### Migration
+
+- `cfg.symbol` → `cfg.symbols()`；`cfg.timeframe` → `cfg.timeframes()`；`cfg.price_type` → `cfg.price_type()`；`cfg.output_dir` → `cfg.output_dir()`；`cfg.concurrency` → `cfg.concurrency().get()`。
+- `DownloadTask { .. }` → `DownloadTask::new(url, dest, symbol, bucket)`；字段读取改为 `url()` / `dest()` / `symbol()` / `bucket()`。
+- `run_downloads(client, tasks, n, &gate)` → `run_downloads(client, tasks, &DownloadGate::new(n))`。
+- `DownloadOptions { allow_missing }` → `DownloadOptions::new().with_allow_missing(true)`。
+- `stats.ok` → `stats.ok()`，其余计数同理。
+- `ddd::utils::scan_local_files::scan_local_files` → `ddd::scan_local_files`。
+
 ## [0.1.0] - 2026-11-13
 
 ### Added

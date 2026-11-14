@@ -49,6 +49,22 @@ pub enum AppError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// Another instance already holds the run lock on the output directory.
+    ///
+    /// The lock is a directory, not an OS file lock, so it is not released
+    /// when a process dies. The message names the directory to remove once
+    /// the user has confirmed that no download is running.
+    #[error(
+        "another instance holds the lock on {output_dir} ({lock_path}); \
+         remove that directory if no download is running"
+    )]
+    RunLocked {
+        /// Output directory the lock protects.
+        output_dir: std::path::PathBuf,
+        /// Lock directory that already exists.
+        lock_path: std::path::PathBuf,
+    },
+
     /// A single download failed.
     #[error("download failed for {url}: {reason}")]
     DownloadFailed {

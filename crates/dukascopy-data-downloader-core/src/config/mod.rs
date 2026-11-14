@@ -1,58 +1,54 @@
 //! Configuration model: parsing, validation and range resolution.
 //!
-//! [`AppConfig`] is deserialized straight from TOML. Every field is validated
-//! at load time — notably [`Symbol`], which rejects anything that is not a
-//! bare Dukascopy symbol code before it can reach a URL or a local path — so
-//! the download pipeline can assume well-formed input and never re-check user
-//! data downstream.
+//! `RawConfig` mirrors the TOML file and is only used inside this module.
+//! [`AppConfig`] is the validated form: its fields are private and exposed
+//! through read-only accessors, so every value the pipeline sees has already
+//! passed validation — notably [`Symbol`], which rejects anything that is not
+//! a bare Dukascopy symbol code before it can reach a URL or a local path.
 //!
 //! The domain types live next to this module: [`Symbol`], [`Timeframe`],
-//! [`PriceType`], [`DownloadTask`] and the date-range defaults.
+//! [`PriceType`], [`BucketKey`] and the date-range defaults. Download tasks
+//! are execution objects and live in [`crate::app::download`].
 
 mod bucket;
 mod price_type;
 mod range;
 mod symbol;
-mod task;
 mod timeframe;
 
 pub use bucket::BucketKey;
+pub(crate) use bucket::{buckets_between, last_closed_day};
 pub use price_type::PriceType;
 pub use range::{DEFAULT_START, MAX_RANGE_DAYS};
 pub use symbol::Symbol;
-pub use task::DownloadTask;
 pub use timeframe::Timeframe;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::AppError;
 
-/// Application configuration loaded from TOML.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// TOML-facing configuration.
+///
+/// Kept private: callers go through [`AppConfig`], which has already
+/// validated every field.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub struct AppConfig {
-    /// Trading symbols to download.
-    pub symbol: Vec<Symbol>,
-    /// Timeframes to download.
-    pub timeframe: Vec<Timeframe>,
-    /// Quote type to download.
+struct RawConfig {
+    symbol: Vec<Symbol>,
+    timeframe: Vec<Timeframe>,
     #[serde(default)]
-    pub price_type: PriceType,
-    /// Explicit range start; defaults to [`DEFAULT_START`] when absent.
+    price_type: PriceType,
     #[serde(default)]
-    pub start: Option<chrono::NaiveDate>,
-    /// Explicit range end; clamped to yesterday by [`AppConfig::resolved_end`].
+    start: Option<chrono::NaiveDate>,
     #[serde(default)]
-    pub end: Option<chrono::NaiveDate>,
-    /// Data root directory; the `dukascopy/` prefix is appended automatically.
+    end: Option<chrono::NaiveDate>,
     #[serde(default = "default_output_dir")]
-    pub output_dir: PathBuf,
-    /// Maximum downloads in flight **across the whole run**, not per pair.
+    output_dir: PathBuf,
     #[serde(default = "default_concurrency")]
-    pub concurrency: usize,
+    concurrency: usize,
 }
 
 fn default_output_dir() -> PathBuf {
@@ -65,6 +61,23 @@ fn default_concurrency() -> usize {
 
 /// Upper bound for the shared download gate (also the client pool size).
 const MAX_CONCURRENCY: usize = 256;
+
+/// Validated application configuration.
+///
+/// Construct it with [`AppConfig::load`] or [`AppConfig::from_toml_str`];
+/// fields are read-only so the invariants checked at construction (non-empty
+/// symbol/timeframe lists, `1..=256` concurrency, no reversed explicit range)
+/// cannot be broken afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppConfig {
+    symbol: Vec<Symbol>,
+    timeframe: Vec<Timeframe>,
+    price_type: PriceType,
+    start: Option<chrono::NaiveDate>,
+    end: Option<chrono::NaiveDate>,
+    output_dir: PathBuf,
+    concurrency: NonZeroUsize,
+}
 
 impl AppConfig {
     /// Load and validate configuration from `path`.
@@ -79,53 +92,129 @@ impl AppConfig {
     /// use std::path::Path;
     ///
     /// # fn main() -> Result<(), ddd::AppError> {
-    /// let cfg = ddd::config::AppConfig::load(Path::new("config.toml"))?;
-    /// println!("{} symbols", cfg.symbol.len());
+    /// let cfg = ddd::AppConfig::load(Path::new("config.toml"))?;
+    /// println!("{} symbols", cfg.symbols().len());
     /// # Ok(())
     /// # }
     /// ```
     pub fn load(path: &Path) -> Result<Self, AppError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| AppError::Config(format!("{}: {e}", path.display())))?;
-        let cfg: Self = toml::from_str(&raw)
-            .map_err(|e| AppError::Config(format!("{}: {e}", path.display())))?;
-        cfg.validate()
+        Self::from_toml_str(&raw).map_err(|e| match e {
+            AppError::Config(message) => AppError::Config(format!("{}: {message}", path.display())),
+            other => other,
+        })
     }
 
-    fn validate(mut self) -> Result<Self, AppError> {
-        if self.symbol.is_empty() {
+    /// Parse and validate configuration from a TOML string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Config`] if the text is not valid TOML, contains
+    /// unknown keys, or violates a validation rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() -> Result<(), ddd::AppError> {
+    /// let cfg = ddd::AppConfig::from_toml_str(
+    ///     "symbol = [\"EURUSD\"]\ntimeframe = [\"1d\"]",
+    /// )?;
+    /// assert_eq!(cfg.symbols().len(), 1);
+    /// assert_eq!(cfg.timeframes(), &[ddd::Timeframe::D1]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_toml_str(text: &str) -> Result<Self, AppError> {
+        let raw: RawConfig = toml::from_str(text).map_err(|e| AppError::Config(e.to_string()))?;
+        Self::try_from(raw)
+    }
+
+    /// Trading symbols to download, sorted and deduplicated.
+    #[must_use]
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbol
+    }
+
+    /// Timeframes to download, sorted and deduplicated.
+    #[must_use]
+    pub fn timeframes(&self) -> &[Timeframe] {
+        &self.timeframe
+    }
+
+    /// Quote type to download.
+    #[must_use]
+    pub const fn price_type(&self) -> PriceType {
+        self.price_type
+    }
+
+    /// Explicit range start, if configured.
+    #[must_use]
+    pub const fn start(&self) -> Option<chrono::NaiveDate> {
+        self.start
+    }
+
+    /// Explicit range end, if configured.
+    #[must_use]
+    pub const fn end(&self) -> Option<chrono::NaiveDate> {
+        self.end
+    }
+
+    /// Data root directory; the `dukascopy/` prefix is appended automatically.
+    #[must_use]
+    pub fn output_dir(&self) -> &Path {
+        &self.output_dir
+    }
+
+    /// Maximum downloads in flight **across the whole run**, not per pair.
+    #[must_use]
+    pub const fn concurrency(&self) -> NonZeroUsize {
+        self.concurrency
+    }
+}
+
+impl TryFrom<RawConfig> for AppConfig {
+    type Error = AppError;
+
+    fn try_from(mut raw: RawConfig) -> Result<Self, Self::Error> {
+        if raw.symbol.is_empty() {
             return Err(AppError::Config(
                 "symbol must contain at least one symbol".into(),
             ));
         }
-        if self.timeframe.is_empty() {
+        if raw.timeframe.is_empty() {
             return Err(AppError::Config(
                 "timeframe must contain at least one timeframe".into(),
             ));
         }
-        if self.concurrency == 0 {
-            return Err(AppError::Config(
-                "concurrency must be greater than zero".into(),
-            ));
-        }
-        if self.concurrency > MAX_CONCURRENCY {
+        let concurrency = NonZeroUsize::new(raw.concurrency)
+            .ok_or_else(|| AppError::Config("concurrency must be greater than zero".into()))?;
+        if concurrency.get() > MAX_CONCURRENCY {
             return Err(AppError::Config(format!(
                 "concurrency {} exceeds maximum {MAX_CONCURRENCY}",
-                self.concurrency
+                concurrency.get()
             )));
         }
-        if let (Some(start), Some(end)) = (self.start, self.end) {
+        if let (Some(start), Some(end)) = (raw.start, raw.end) {
             if start > end {
                 return Err(AppError::Config(format!(
                     "start {start} is after end {end}"
                 )));
             }
         }
-        self.symbol.sort();
-        self.symbol.dedup();
-        self.timeframe.sort();
-        self.timeframe.dedup();
-        Ok(self)
+        raw.symbol.sort();
+        raw.symbol.dedup();
+        raw.timeframe.sort();
+        raw.timeframe.dedup();
+        Ok(Self {
+            symbol: raw.symbol,
+            timeframe: raw.timeframe,
+            price_type: raw.price_type,
+            start: raw.start,
+            end: raw.end,
+            output_dir: raw.output_dir,
+            concurrency,
+        })
     }
 }
 
@@ -152,7 +241,7 @@ mod tests {
     }
 
     fn symbols(cfg: &AppConfig) -> Vec<&str> {
-        cfg.symbol.iter().map(Symbol::as_str).collect()
+        cfg.symbols().iter().map(Symbol::as_str).collect()
     }
 
     #[test]
@@ -164,7 +253,7 @@ mod tests {
     #[test]
     fn symbol_dedups_after_normalisation() {
         let cfg = cfg("symbol = [\"EURUSD\", \"EURUSD\"]\ntimeframe = [\"D1\"]");
-        assert_eq!(cfg.symbol.len(), 1);
+        assert_eq!(cfg.symbols().len(), 1);
     }
 
     // — loading —
@@ -179,24 +268,32 @@ mod tests {
              output_dir = \"/tmp/data\"\n\
              concurrency = 8");
         assert_eq!(symbols(&cfg), vec!["EURUSD", "GBPUSD"]);
-        assert_eq!(cfg.timeframe, vec![Timeframe::H1, Timeframe::D1]);
-        assert_eq!(cfg.price_type, PriceType::Ask);
-        assert_eq!(cfg.start, Some(date(2024, 1, 1)));
-        assert_eq!(cfg.end, Some(date(2025, 1, 1)));
-        assert_eq!(cfg.output_dir, PathBuf::from("/tmp/data"));
-        assert_eq!(cfg.concurrency, 8);
+        assert_eq!(cfg.timeframes(), &[Timeframe::H1, Timeframe::D1]);
+        assert_eq!(cfg.price_type(), PriceType::Ask);
+        assert_eq!(cfg.start(), Some(date(2024, 1, 1)));
+        assert_eq!(cfg.end(), Some(date(2025, 1, 1)));
+        assert_eq!(cfg.output_dir(), Path::new("/tmp/data"));
+        assert_eq!(cfg.concurrency().get(), 8);
     }
 
     #[test]
     fn load_minimal_config() {
         let cfg = cfg("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]");
         assert_eq!(symbols(&cfg), vec!["EURUSD"]);
-        assert_eq!(cfg.timeframe, vec![Timeframe::D1]);
-        assert_eq!(cfg.price_type, PriceType::Bid);
-        assert_eq!(cfg.start, None);
-        assert_eq!(cfg.end, None);
-        assert_eq!(cfg.output_dir, PathBuf::from("data"));
-        assert_eq!(cfg.concurrency, 30);
+        assert_eq!(cfg.timeframes(), &[Timeframe::D1]);
+        assert_eq!(cfg.price_type(), PriceType::Bid);
+        assert_eq!(cfg.start(), None);
+        assert_eq!(cfg.end(), None);
+        assert_eq!(cfg.output_dir(), Path::new("data"));
+        assert_eq!(cfg.concurrency().get(), 30);
+    }
+
+    #[test]
+    fn from_toml_str_matches_the_file_loader() {
+        let from_text =
+            AppConfig::from_toml_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
+        let from_file = cfg("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]");
+        assert_eq!(from_text, from_file);
     }
 
     #[test]
@@ -205,7 +302,7 @@ mod tests {
             "symbol = [\"GBPUSD\", \"EURUSD\", \"GBPUSD\"]\ntimeframe = [\"H1\", \"D1\", \"D1\"]",
         );
         assert_eq!(symbols(&cfg), vec!["EURUSD", "GBPUSD"]);
-        assert_eq!(cfg.timeframe, vec![Timeframe::H1, Timeframe::D1]);
+        assert_eq!(cfg.timeframes(), &[Timeframe::H1, Timeframe::D1]);
     }
 
     #[test]
@@ -223,7 +320,7 @@ mod tests {
 
     #[test]
     fn start_default_key_is_no_longer_accepted() {
-        // It was an undocumented, never-documented escape hatch; now it is gone.
+        // It was an undocumented escape hatch; now it is gone.
         let err =
             load("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart_default = \"2021-01-01\"")
                 .unwrap_err();
@@ -235,7 +332,7 @@ mod tests {
     #[test]
     fn timeframe_aliases_normalize_and_dedup() {
         let cfg = cfg("symbol = [\"EURUSD\"]\ntimeframe = [\"M1\", \"1m\", \"1h\", \"H1\"]");
-        assert_eq!(cfg.timeframe, vec![Timeframe::M1, Timeframe::H1]);
+        assert_eq!(cfg.timeframes(), &[Timeframe::M1, Timeframe::H1]);
     }
 
     #[test]

@@ -5,14 +5,19 @@
 //! them, mirroring the server directory layout under `output_dir/dukascopy/`.
 //!
 //! Module layout: [`app`] holds the pipeline ([`app::build_urls`],
-//! [`app::build_download_tasks`], [`app::download`]); [`utils`] holds
-//! [`utils::scan_local_files`] and the backoff policy.
+//! [`app::build_download_tasks`], [`app::download`]); [`config`] holds the
+//! validated configuration and the domain types. The pipeline owns its
+//! cache scan, run lock and retry policy, so nothing outside [`app`] has to
+//! know about them.
+//!
+//! The crate root re-exports the types an embedder needs; the module paths
+//! stay available for code that wants to be explicit.
 //!
 //! # Example
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), ddd::AppError> {
-//! ddd::app::run(std::path::Path::new("config.toml")).await
+//! ddd::run(std::path::Path::new("config.toml")).await
 //! # }
 //! ```
 //!
@@ -21,14 +26,13 @@
 //! the binary and the integration tests alike.
 
 pub mod app;
-
 pub mod config;
 pub mod error;
-pub mod utils;
 
-pub use app::download::DownloadOptions;
-pub use app::run;
+pub use app::download::{DownloadGate, DownloadOptions, DownloadStats, DownloadTask};
+pub use app::scan_local_files;
+pub use app::{run, run_with};
 pub use config::{
-    AppConfig, BucketKey, DEFAULT_START, DownloadTask, MAX_RANGE_DAYS, PriceType, Symbol, Timeframe,
+    AppConfig, BucketKey, DEFAULT_START, MAX_RANGE_DAYS, PriceType, Symbol, Timeframe,
 };
 pub use error::AppError;

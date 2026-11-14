@@ -3,14 +3,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
-
 use super::build_download_tasks;
-use super::build_urls;
 use super::download;
-use super::download::DownloadOptions;
+use super::download::{DownloadGate, DownloadOptions};
 use crate::AppError;
-use crate::config::{AppConfig, Symbol, Timeframe};
+use crate::config::{AppConfig, Symbol, Timeframe, last_closed_day};
 
 /// State shared by every pair task. Cloning is cheap: the client is a refcount
 /// bump and the rest are `Arc`s.
@@ -19,7 +16,7 @@ pub(super) struct SharedRun {
     pub(super) client: reqwest::Client,
     pub(super) cfg: Arc<AppConfig>,
     pub(super) local: Arc<HashSet<String>>,
-    pub(super) gate: Arc<Semaphore>,
+    pub(super) gate: DownloadGate,
     pub(super) start: chrono::NaiveDate,
     pub(super) end: chrono::NaiveDate,
     /// Current UTC date, used to tell final buckets from unfinished ones.
@@ -88,7 +85,7 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
     // appending to an unfinished bucket, and the cache never re-downloads a
     // file it already has — so an unfinished bucket would be frozen at
     // whatever it held at download time, leaving a permanent hole.
-    let closed_end = build_urls::last_closed_day(timeframe, end, today);
+    let closed_end = last_closed_day(timeframe, end, today);
     if start > closed_end {
         tracing::debug!(
             symbol = %symbol,
@@ -111,11 +108,11 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
     let tasks = build_download_tasks::build_download_tasks(
         symbol,
         timeframe,
-        cfg.price_type,
+        cfg.price_type(),
         start,
         closed_end,
         local,
-        &cfg.output_dir,
+        cfg.output_dir(),
     );
 
     if tasks.is_empty() {
@@ -128,15 +125,15 @@ async fn run_one(ctx: PairCtx<'_>) -> Result<(), AppError> {
     }
 
     tracing::debug!(symbol = %symbol, files = tasks.len(), "downloading");
-    let stats = download::run_downloads_with(client, tasks, cfg.concurrency, gate, opts).await?;
+    let stats = download::run_downloads_with(client, tasks, gate, opts).await?;
     tracing::info!(
         symbol = %symbol,
         timeframe = %timeframe,
-        ok = stats.ok,
-        not_found = stats.not_found,
-        failed = stats.failed,
-        skipped = stats.skipped,
-        total = stats.total,
+        ok = stats.ok(),
+        not_found = stats.not_found(),
+        failed = stats.failed(),
+        skipped = stats.skipped(),
+        total = stats.total(),
         "pair download complete",
     );
 

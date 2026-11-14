@@ -21,7 +21,7 @@ const MAX_SYMBOL_LEN: usize = 20;
 /// Dukascopy uses it in instrument codes, but a symbol may not be `.`/`..`,
 /// and may not start or end with a dot or contain consecutive dots.
 ///
-/// The payload is an `Arc<str>`: cloning a [`crate::config::DownloadTask`]
+/// The payload is an `Arc<str>`: cloning a [`crate::DownloadTask`]
 /// (one per file) must not allocate a copy of the symbol for every task. The
 /// type makes an invalid symbol unrepresentable rather than merely unlikely.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

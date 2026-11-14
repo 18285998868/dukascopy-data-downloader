@@ -31,9 +31,8 @@ impl AppConfig {
     /// # Examples
     ///
     /// ```
-    /// # use ddd::config::AppConfig;
-    /// let cfg: AppConfig =
-    ///     toml::from_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
+    /// # use ddd::AppConfig;
+    /// let cfg = AppConfig::from_toml_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
     /// let today = chrono::NaiveDate::from_ymd_opt(2025, 3, 2).unwrap();
     ///
     /// // Without an explicit `end`, the range stops at yesterday.
@@ -45,7 +44,7 @@ impl AppConfig {
     #[must_use]
     pub fn resolved_end(&self, today: chrono::NaiveDate) -> chrono::NaiveDate {
         let yesterday = today.pred_opt().unwrap_or(today);
-        self.end.map_or(yesterday, |e| e.min(yesterday))
+        self.end().map_or(yesterday, |e| e.min(yesterday))
     }
 
     /// Resolve the *effective* `(start, end)` range and enforce the day cap.
@@ -70,9 +69,8 @@ impl AppConfig {
     /// # Examples
     ///
     /// ```
-    /// # use ddd::config::AppConfig;
-    /// let cfg: AppConfig =
-    ///     toml::from_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
+    /// # use ddd::AppConfig;
+    /// let cfg = AppConfig::from_toml_str("symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]").unwrap();
     /// let today = chrono::NaiveDate::from_ymd_opt(2025, 3, 2).unwrap();
     /// let (start, end) = cfg.effective_range(today).unwrap();
     /// assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
@@ -83,7 +81,7 @@ impl AppConfig {
         today: chrono::NaiveDate,
     ) -> Result<(chrono::NaiveDate, chrono::NaiveDate), AppError> {
         let end = self.resolved_end(today);
-        let start = self.start.unwrap_or_else(|| {
+        let start = self.start().unwrap_or_else(|| {
             // Keep the default inside the cap once 2020-01-01 is too old.
             // `checked_sub_signed` avoids panicking for extreme `today`
             // values supplied through the public API.

@@ -15,9 +15,13 @@ pub mod build_download_tasks;
 pub mod build_urls;
 pub mod download;
 
+mod cache;
 mod client;
+mod lock;
 mod pair;
 mod signal;
+
+pub use cache::scan_local_files;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,7 +32,7 @@ use tokio::task::JoinSet;
 use crate::AppError;
 use crate::config::AppConfig;
 use client::build_client;
-use download::DownloadOptions;
+use download::{DownloadGate, DownloadOptions};
 use pair::{SharedRun, run_pair};
 use signal::termination_signal;
 
@@ -94,9 +98,7 @@ pub async fn run(config_path: &Path) -> Result<(), AppError> {
 /// // Best effort: keep whatever the feed did have.
 /// ddd::app::run_with(
 ///     std::path::Path::new("config.toml"),
-///     &ddd::DownloadOptions {
-///         allow_missing: true,
-///     },
+///     &ddd::DownloadOptions::new().with_allow_missing(true),
 /// )
 /// .await
 /// # }
@@ -130,11 +132,10 @@ async fn run_with_today(
 
     // Take the exclusive lock on the output directory. Two instances sharing
     // one `output_dir` would delete each other's scratch files.
-    let output_dir = cfg.output_dir.clone();
-    let lock =
-        tokio::task::spawn_blocking(move || crate::utils::run_lock::acquire_run_lock(&output_dir))
-            .await
-            .map_err(AppError::from)??;
+    let output_dir = cfg.output_dir().to_path_buf();
+    let lock = tokio::task::spawn_blocking(move || lock::acquire_run_lock(&output_dir))
+        .await
+        .map_err(AppError::from)??;
 
     // The lock guard is owned by the *pipeline future*, so dropping that
     // future — which is exactly what an interruption does — releases the
@@ -156,7 +157,7 @@ async fn run_with_today(
 async fn run_pipeline(
     cfg: AppConfig,
     opts: &DownloadOptions,
-    _lock: crate::utils::run_lock::RunLock,
+    _lock: lock::RunLock,
     today: chrono::NaiveDate,
 ) -> Result<(), AppError> {
     // Resolve the range *before* any I/O: it is pure arithmetic, so a
@@ -180,14 +181,14 @@ async fn run_pipeline(
         .await
         .map_err(AppError::from)??;
 
-    let local = crate::utils::scan_local_files::scan_local_files(&cfg.output_dir).await?;
-    let concurrency = cfg.concurrency;
+    let local = cache::scan_local_files(cfg.output_dir()).await?;
+    let concurrency = cfg.concurrency();
 
     tracing::info!(
-        symbols = cfg.symbol.len(),
-        timeframes = cfg.timeframe.len(),
-        pairs = cfg.symbol.len() * cfg.timeframe.len(),
-        concurrency,
+        symbols = cfg.symbols().len(),
+        timeframes = cfg.timeframes().len(),
+        pairs = cfg.symbols().len() * cfg.timeframes().len(),
+        concurrency = concurrency.get(),
         start = %start,
         end = %end,
         "starting dukascopy batch download",
@@ -198,7 +199,7 @@ async fn run_pipeline(
         client,
         cfg,
         // One gate for the whole run: `concurrency` is a global in-flight ceiling.
-        gate: Arc::new(Semaphore::new(concurrency)),
+        gate: DownloadGate::new(concurrency),
         local: Arc::new(local),
         start,
         end,
@@ -212,8 +213,8 @@ async fn run_pipeline(
     // of it: `Vec<Symbol>` is a `Vec<String>`, so cloning it would allocate
     // one `String` per symbol for no reason.
     let cfg = Arc::clone(&shared.cfg);
-    'schedule: for symbol in &cfg.symbol {
-        for timeframe in &cfg.timeframe {
+    'schedule: for symbol in cfg.symbols() {
+        for timeframe in cfg.timeframes() {
             let symbol = symbol.clone();
             let timeframe = *timeframe;
             let shared = shared.clone();
@@ -369,7 +370,7 @@ mod tests {
         let (dir, path) = config(
             "symbol = [\"EURUSD\"]\ntimeframe = [\"D1\"]\nstart = \"2025-01-01\"\nend = \"2025-01-01\"\n",
         );
-        let lock = crate::utils::run_lock::acquire_run_lock(dir.path()).unwrap();
+        let lock = lock::acquire_run_lock(dir.path()).unwrap();
 
         let err = run(&path).await.unwrap_err();
         assert!(err.to_string().contains("another instance"), "{err}");

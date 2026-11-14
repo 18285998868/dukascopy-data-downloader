@@ -7,10 +7,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use ddd::config::{AppConfig, BucketKey, PriceType, Symbol, Timeframe};
-use ddd::utils::scan_local_files::scan_local_files;
+use ddd::scan_local_files;
 
 /// Write `body` into a fresh temp directory and return the config path.
 #[expect(
@@ -40,11 +39,11 @@ fn config_round_trips_through_the_public_loader() {
     );
     let cfg = AppConfig::load(&path).unwrap();
 
-    assert_eq!(cfg.symbol.len(), 1, "duplicates must be collapsed");
-    assert_eq!(cfg.symbol[0].as_str(), "EURUSD");
-    assert_eq!(cfg.timeframe, vec![Timeframe::D1], "aliases normalise");
-    assert_eq!(cfg.price_type, PriceType::Ask);
-    assert_eq!(cfg.concurrency, 8);
+    assert_eq!(cfg.symbols().len(), 1, "duplicates must be collapsed");
+    assert_eq!(cfg.symbols()[0].as_str(), "EURUSD");
+    assert_eq!(cfg.timeframes(), &[Timeframe::D1], "aliases normalise");
+    assert_eq!(cfg.price_type(), PriceType::Ask);
+    assert_eq!(cfg.concurrency().get(), 8);
 }
 
 #[test]
@@ -79,15 +78,16 @@ fn urls_destinations_and_task_metadata_stay_in_sync() {
     assert_eq!(tasks.len(), 1);
     let task = &tasks[0];
     assert!(
-        task.url.ends_with("/EURUSD/2025/06/BID_candles_hour_1.bi5"),
+        task.url()
+            .ends_with("/EURUSD/2025/06/BID_candles_hour_1.bi5"),
         "{}",
-        task.url
+        task.url()
     );
     assert_eq!(
-        task.dest,
+        task.dest(),
         Path::new("/out/dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5")
     );
-    assert_eq!(task.symbol.as_str(), "EURUSD");
+    assert_eq!(task.symbol().as_str(), "EURUSD");
     assert_eq!(task.timeframe(), Timeframe::H1);
 }
 
@@ -143,7 +143,7 @@ async fn the_price_type_is_part_of_the_cache_key() {
     );
 
     assert_eq!(tasks.len(), 1);
-    assert!(tasks[0].dest.ends_with("ASK_candles_hour_1.bi5"));
+    assert!(tasks[0].dest().ends_with("ASK_candles_hour_1.bi5"));
 }
 
 #[test]
@@ -160,16 +160,16 @@ fn the_error_chain_exposes_the_root_cause() {
 #[tokio::test]
 async fn an_empty_batch_succeeds_with_zeroed_statistics() {
     let client = reqwest::Client::new();
-    let gate = Arc::new(tokio::sync::Semaphore::new(2));
+    let gate = ddd::DownloadGate::new(std::num::NonZeroUsize::new(2).unwrap());
 
-    let stats = ddd::app::download::run_downloads(&client, Vec::new(), 2, &gate)
+    let stats = ddd::app::download::run_downloads(&client, Vec::new(), &gate)
         .await
         .unwrap();
 
-    assert_eq!(stats.total, 0);
-    assert_eq!(stats.ok, 0);
-    assert_eq!(stats.failed, 0);
-    assert_eq!(stats.skipped, 0);
+    assert_eq!(stats.total(), 0);
+    assert_eq!(stats.ok(), 0);
+    assert_eq!(stats.failed(), 0);
+    assert_eq!(stats.skipped(), 0);
 }
 
 /// A batch may mix timeframes, and the missing-range analysis must then
@@ -190,35 +190,33 @@ async fn a_mixed_timeframe_batch_is_analysed_per_timeframe() {
         .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut tasks: Vec<ddd::config::DownloadTask> = Vec::new();
+    let mut tasks: Vec<ddd::DownloadTask> = Vec::new();
     for year in 2021..=2025 {
-        tasks.push(ddd::config::DownloadTask {
-            url: format!("{}/d1-{year}.bi5", server.uri()),
-            dest: dir
-                .path()
+        tasks.push(ddd::DownloadTask::new(
+            format!("{}/d1-{year}.bi5", server.uri()),
+            dir.path()
                 .join(format!("dukascopy/EURUSD/{year}/BID_candles_day_1.bi5")),
-            symbol: ddd::Symbol::new("EURUSD").unwrap(),
-            bucket: BucketKey::new(
+            ddd::Symbol::new("EURUSD").unwrap(),
+            BucketKey::new(
                 ddd::Timeframe::D1,
                 chrono::NaiveDate::from_ymd_opt(year, 1, 1).unwrap(),
             ),
-        });
+        ));
     }
     // An M1 bucket that sorts *between* two of the years.
-    tasks.push(ddd::config::DownloadTask {
-        url: format!("{}/m1.bi5", server.uri()),
-        dest: dir
-            .path()
+    tasks.push(ddd::DownloadTask::new(
+        format!("{}/m1.bi5", server.uri()),
+        dir.path()
             .join("dukascopy/EURUSD/2023/06/15/BID_candles_min_1.bi5"),
-        symbol: ddd::Symbol::new("EURUSD").unwrap(),
-        bucket: BucketKey::new(
+        ddd::Symbol::new("EURUSD").unwrap(),
+        BucketKey::new(
             ddd::Timeframe::M1,
             chrono::NaiveDate::from_ymd_opt(2023, 6, 15).unwrap(),
         ),
-    });
+    ));
 
-    let gate = Arc::new(tokio::sync::Semaphore::new(4));
-    let err = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, 4, &gate)
+    let gate = ddd::DownloadGate::new(std::num::NonZeroUsize::new(4).unwrap());
+    let err = ddd::app::download::run_downloads(&reqwest::Client::new(), tasks, &gate)
         .await
         .unwrap_err();
 
