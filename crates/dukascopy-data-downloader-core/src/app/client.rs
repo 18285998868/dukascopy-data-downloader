@@ -19,7 +19,7 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Build a direct-connection client (no proxy fallback is attempted).
 ///
 /// `REQUEST_TIMEOUT` bounds one attempt while the backoff policy in
-/// [`crate::utils::backoff`] governs the retry window. The two are deliberately
+/// [`crate::app::download`] governs the retry window. The two are deliberately
 /// on different scales: at equal values a single stalled attempt could consume
 /// the whole retry budget and leave no room for a second try.
 pub(super) fn build_client() -> Result<reqwest::Client, AppError> {

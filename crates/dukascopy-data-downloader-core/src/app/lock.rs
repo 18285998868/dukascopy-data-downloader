@@ -31,6 +31,10 @@ pub struct RunLock {
 
 impl RunLock {
     /// Path of the lock directory.
+    ///
+    /// Only the in-module tests need it; the pipeline releases the lock on
+    /// drop and the error carries the path when acquisition fails.
+    #[cfg(test)]
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -60,28 +64,24 @@ impl Drop for RunLock {
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Config`] if another instance already holds the lock,
-/// or [`AppError::Io`] if the lock directory cannot be created.
+/// Returns [`AppError::RunLocked`] if another instance already holds the lock,
+/// or [`AppError::FileIo`] if the output directory or the lock directory
+/// cannot be created.
 pub fn acquire_run_lock(output_dir: &Path) -> Result<RunLock, AppError> {
     let path = output_dir.join(LOCK_DIR_NAME);
-    std::fs::create_dir_all(output_dir).map_err(|e| {
-        AppError::Io(std::io::Error::new(
-            e.kind(),
-            format!("{}: {e}", output_dir.display()),
-        ))
+    std::fs::create_dir_all(output_dir).map_err(|source| AppError::FileIo {
+        path: output_dir.to_path_buf(),
+        source,
     })?;
     match std::fs::create_dir(&path) {
         Ok(()) => Ok(RunLock { path }),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(AppError::Config(format!(
-            "another instance holds the lock on {} ({}); \
-             remove that directory if no download is running",
-            output_dir.display(),
-            path.display()
-        ))),
-        Err(e) => Err(AppError::Io(std::io::Error::new(
-            e.kind(),
-            format!("{}: {e}", path.display()),
-        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(AppError::RunLocked {
+                output_dir: output_dir.to_path_buf(),
+                lock_path: path,
+            })
+        }
+        Err(source) => Err(AppError::FileIo { path, source }),
     }
 }
 

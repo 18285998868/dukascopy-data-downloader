@@ -5,25 +5,25 @@
 //! requests — each burning the whole retry budget — to reach the verdict a
 //! single request already gives. The remaining files then stream through
 //! `buffer_unordered(concurrency)`, each additionally holding a permit from
-//! the shared [`Semaphore`] gate.
+//! the shared [`DownloadGate`].
 
 use std::future::Future;
-use std::sync::Arc;
 
 use futures::StreamExt;
-use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use crate::AppError;
-use crate::config::{BucketKey, DownloadTask};
+use crate::config::BucketKey;
 
 use super::breaker::{
     BREAKER_FAIL_DEN, BREAKER_FAIL_NUM, BREAKER_WINDOW, Breaker, is_transport_failure,
 };
+use super::gate::DownloadGate;
 use super::options::DownloadOptions;
 use super::ratio::range_verdict;
 use super::stats::DownloadStats;
 use super::stream;
+use super::task::DownloadTask;
 
 /// How often a line of progress is logged, in completed files.
 const PROGRESS_EVERY: usize = 100;
@@ -59,10 +59,9 @@ enum TaskOutcome {
 /// and reports the longest of them. Mixing the two key spaces would make
 /// a three-year gap look like three unrelated days.
 ///
-/// `gate` must have at least one permit. The function only waits for
-/// permits and never adds any, so a zero-permit semaphore makes the first
-/// task wait forever. A gate that is momentarily exhausted by another
-/// batch is fine: those permits are released when that batch finishes.
+/// The gate is created with a non-zero ceiling, and this function never
+/// adds permits, so a gate that is momentarily exhausted by another batch
+/// simply makes this batch wait for that batch to release its permits.
 ///
 /// # Errors
 ///
@@ -76,29 +75,27 @@ enum TaskOutcome {
 /// # Examples
 ///
 /// ```no_run
-/// # use std::sync::Arc;
-/// # use tokio::sync::Semaphore;
+/// # use std::num::NonZeroUsize;
 /// # async fn example() -> Result<(), ddd::AppError> {
 /// let client = reqwest::Client::new();
-/// let gate = Arc::new(Semaphore::new(4));
+/// let gate = ddd::DownloadGate::new(NonZeroUsize::new(4).unwrap());
 ///
 /// // An empty task list is a no-op that still yields usable statistics.
-/// let stats = ddd::app::download::run_downloads(&client, Vec::new(), 4, &gate).await?;
-/// assert_eq!(stats.total, 0);
-/// assert_eq!(stats.ok, 0);
+/// let stats = ddd::app::download::run_downloads(&client, Vec::new(), &gate).await?;
+/// assert_eq!(stats.total(), 0);
+/// assert_eq!(stats.ok(), 0);
 /// # Ok(())
 /// # }
 /// ```
 pub async fn run_downloads(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
-    concurrency: usize,
-    gate: &Arc<Semaphore>,
+    gate: &DownloadGate,
 ) -> Result<DownloadStats, AppError> {
     let download_fn = move |c: reqwest::Client, t: DownloadTask| async move {
         stream::download_to_file(&c, &t).await
     };
-    run_downloads_inner(client, tasks, concurrency, gate, download_fn).await
+    run_downloads_inner(client, tasks, gate, download_fn).await
 }
 
 /// Download all tasks, bounded by the shared `gate`, with explicit options.
@@ -106,8 +103,7 @@ pub async fn run_downloads(
 /// This is [`run_downloads`] plus the options that decide what happens to
 /// a range the feed does not have; see [`DownloadOptions::allow_missing`].
 ///
-/// The `gate` precondition is the same as [`run_downloads`]: it must have
-/// at least one permit, because this function never adds permits itself.
+/// The gate precondition is the same as [`run_downloads`].
 ///
 /// # Errors
 ///
@@ -118,32 +114,27 @@ pub async fn run_downloads(
 /// # Examples
 ///
 /// ```no_run
-/// # use std::sync::Arc;
-/// # use tokio::sync::Semaphore;
+/// # use std::num::NonZeroUsize;
 /// # async fn example() -> Result<(), ddd::AppError> {
 /// let client = reqwest::Client::new();
-/// let gate = Arc::new(Semaphore::new(4));
-/// let opts = ddd::DownloadOptions {
-///     allow_missing: true,
-/// };
+/// let gate = ddd::DownloadGate::new(NonZeroUsize::new(4).unwrap());
+/// let opts = ddd::DownloadOptions::new().with_allow_missing(true);
 ///
-/// let stats =
-///     ddd::app::download::run_downloads_with(&client, Vec::new(), 4, &gate, &opts).await?;
-/// assert_eq!(stats.total, 0);
+/// let stats = ddd::app::download::run_downloads_with(&client, Vec::new(), &gate, &opts).await?;
+/// assert_eq!(stats.total(), 0);
 /// # Ok(())
 /// # }
 /// ```
 pub async fn run_downloads_with(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
-    concurrency: usize,
-    gate: &Arc<Semaphore>,
+    gate: &DownloadGate,
     opts: &DownloadOptions,
 ) -> Result<DownloadStats, AppError> {
     let download_fn = move |c: reqwest::Client, t: DownloadTask| async move {
         stream::download_to_file(&c, &t).await
     };
-    run_downloads_inner_with(client, tasks, concurrency, gate, *opts, download_fn).await
+    run_downloads_inner_with(client, tasks, gate, *opts, download_fn).await
 }
 
 /// Core download orchestration with the default (strict) options.
@@ -152,23 +143,14 @@ pub async fn run_downloads_with(
 async fn run_downloads_inner<F, Fut>(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
-    concurrency: usize,
-    gate: &Arc<Semaphore>,
+    gate: &DownloadGate,
     download_fn: F,
 ) -> Result<DownloadStats, AppError>
 where
     F: Fn(reqwest::Client, DownloadTask) -> Fut,
     Fut: Future<Output = Result<(), AppError>>,
 {
-    run_downloads_inner_with(
-        client,
-        tasks,
-        concurrency,
-        gate,
-        DownloadOptions::default(),
-        download_fn,
-    )
-    .await
+    run_downloads_inner_with(client, tasks, gate, DownloadOptions::default(), download_fn).await
 }
 
 /// Core download orchestration, parameterized by the download function for testing.
@@ -186,8 +168,7 @@ where
 async fn run_downloads_inner_with<F, Fut>(
     client: &reqwest::Client,
     tasks: Vec<DownloadTask>,
-    concurrency: usize,
-    gate: &Arc<Semaphore>,
+    gate: &DownloadGate,
     opts: DownloadOptions,
     download_fn: F,
 ) -> Result<DownloadStats, AppError>
@@ -196,7 +177,9 @@ where
     Fut: Future<Output = Result<(), AppError>>,
 {
     let total = tasks.len();
-    let concurrency = concurrency.max(1);
+    // The gate owns the ceiling, so the per-batch stream width and the shared
+    // permit pool can never disagree.
+    let concurrency = gate.max_in_flight().get();
     let mut tasks = tasks.into_iter();
 
     // — probe —
@@ -206,10 +189,7 @@ where
     };
     tracing::debug!(total, concurrency, "downloading files");
 
-    let mut stats = DownloadStats {
-        total,
-        ..DownloadStats::default()
-    };
+    let mut stats = DownloadStats::with_total(total);
     let mut reasons: Vec<String> = Vec::with_capacity(MAX_REPORTED_FAILURES);
     let mut missing_buckets: Vec<BucketKey> = Vec::new();
     let breaker = Breaker::new();
@@ -223,8 +203,8 @@ where
         // reach the same verdict, so stop here.
         breaker.trip();
         tracing::warn!(
-            failed = stats.failed,
-            total = stats.total,
+            failed = stats.failed(),
+            total = stats.total(),
             "probe could not reach the endpoint; remaining files were not attempted",
         );
     }
@@ -248,11 +228,11 @@ where
         if stats.done() % PROGRESS_EVERY == 0 {
             tracing::info!(
                 done = stats.done(),
-                total = stats.total,
-                ok = stats.ok,
-                not_found = stats.not_found,
-                failed = stats.failed,
-                skipped = stats.skipped,
+                total = stats.total(),
+                ok = stats.ok(),
+                not_found = stats.not_found(),
+                failed = stats.failed(),
+                skipped = stats.skipped(),
                 "download progress",
             );
         }
@@ -273,20 +253,20 @@ fn record_outcome(
     missing_buckets: &mut Vec<BucketKey>,
 ) {
     match outcome {
-        TaskOutcome::Ok => stats.ok = stats.ok.saturating_add(1),
+        TaskOutcome::Ok => stats.record_ok(),
         TaskOutcome::NotFound { bucket } => {
-            stats.not_found = stats.not_found.saturating_add(1);
+            stats.record_not_found();
             missing_buckets.push(bucket);
         }
         TaskOutcome::Failed(err) => {
-            stats.failed = stats.failed.saturating_add(1);
+            stats.record_failed();
             if reasons.len() < MAX_REPORTED_FAILURES {
                 reasons.push(err.chain());
             } else {
                 tracing::debug!(error = %err.chain(), "download failed (detail not retained)");
             }
         }
-        TaskOutcome::Skipped => stats.skipped = stats.skipped.saturating_add(1),
+        TaskOutcome::Skipped => stats.record_skipped(),
     }
 }
 
@@ -302,34 +282,34 @@ fn finalize_batch(
     missing_buckets: &[BucketKey],
     opts: DownloadOptions,
 ) -> Result<DownloadStats, AppError> {
-    if stats.not_found > 0 {
+    if stats.not_found() > 0 {
         tracing::debug!(
-            not_found = stats.not_found,
-            total = stats.total,
+            not_found = stats.not_found(),
+            total = stats.total(),
             "files not found on server (404)",
         );
     }
     if stats.circuit_open() {
         tracing::warn!(
-            skipped = stats.skipped,
-            failed = stats.failed,
+            skipped = stats.skipped(),
+            failed = stats.failed(),
             window = BREAKER_WINDOW,
             fail_ratio = format!("{BREAKER_FAIL_NUM}/{}", BREAKER_FAIL_DEN),
             "circuit breaker opened; remaining files for this pair were not attempted",
         );
     }
-    if stats.failed > reasons.len() {
+    if stats.failed() > reasons.len() {
         tracing::warn!(
-            hidden = stats.failed - reasons.len(),
+            hidden = stats.failed() - reasons.len(),
             "additional failure details not retained",
         );
     }
 
-    if stats.failed > 0 {
+    if stats.failed() > 0 {
         return Err(AppError::BatchFailed {
-            failed: stats.failed,
-            total: stats.total,
-            skipped: stats.skipped,
+            failed: stats.failed(),
+            total: stats.total(),
+            skipped: stats.skipped(),
             reasons,
         });
     }
@@ -345,7 +325,7 @@ fn finalize_batch(
 /// inflate the failure count.
 async fn run_one_task<F, Fut>(
     client: &reqwest::Client,
-    gate: &Arc<Semaphore>,
+    gate: &DownloadGate,
     breaker: &Breaker,
     download_fn: &F,
     task: DownloadTask,
@@ -354,14 +334,14 @@ where
     F: Fn(reqwest::Client, DownloadTask) -> Fut,
     Fut: Future<Output = Result<(), AppError>>,
 {
-    let span = tracing::info_span!("download", symbol = %task.symbol, tf = %task.timeframe());
+    let span = tracing::info_span!("download", symbol = %task.symbol(), tf = %task.timeframe());
     async {
         if breaker.is_open() {
             return TaskOutcome::Skipped;
         }
         // A 404 needs the bucket the task belonged to, and the bucket is
         // carried by the task itself — no re-parsing of the destination path.
-        let bucket = task.bucket;
+        let bucket = task.bucket();
         // The gate is normally never closed; a caller can close it through the
         // public API, so that case becomes a structured failure instead of a
         // panic.
@@ -393,33 +373,27 @@ where
 mod tests {
     use super::*;
     use crate::config::{Symbol, Timeframe};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize as Counter;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    fn task_named(symbol: &str, tag: &str) -> DownloadTask {
-        DownloadTask {
-            url: format!("http://example.com/{symbol}/{tag}"),
-            dest: std::path::PathBuf::from("/tmp"),
-            symbol: Symbol::new(symbol).unwrap(),
-            bucket: BucketKey::new(
-                Timeframe::D1,
-                chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-            ),
-        }
+    fn date(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).expect("test date is valid")
     }
 
-    /// A task with an explicit timeframe and destination path.
-    fn task_for(timeframe: Timeframe, dest: &str, tag: &str) -> DownloadTask {
-        DownloadTask {
-            url: format!("http://example.com/EURUSD/{tag}"),
-            dest: std::path::PathBuf::from(dest),
-            symbol: Symbol::new("EURUSD").unwrap(),
-            bucket: BucketKey::new(
-                timeframe,
-                chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
-            ),
-        }
+    fn task_with_bucket(bucket: BucketKey, dest: &str, tag: &str) -> DownloadTask {
+        DownloadTask::new(
+            format!("http://example.com/EURUSD/{tag}"),
+            std::path::PathBuf::from(dest),
+            Symbol::new("EURUSD").expect("test symbol is valid"),
+            bucket,
+        )
+    }
+
+    fn task_named(tag: &str) -> DownloadTask {
+        task_with_bucket(BucketKey::new(Timeframe::D1, date(2025, 1, 1)), "/tmp", tag)
     }
 
     /// `n` M1 tasks on consecutive days, starting 2025-01-01.
@@ -428,12 +402,12 @@ mod tests {
     /// date, so an impossible day number would break the chain.
     fn daily_tasks(n: usize) -> Vec<DownloadTask> {
         use chrono::Datelike;
-        let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let start = date(2025, 1, 1);
         (0..n)
             .map(|i| {
                 let day = start + chrono::Duration::days(i64::try_from(i).expect("n fits in i64"));
-                let mut task = task_for(
-                    Timeframe::M1,
+                task_with_bucket(
+                    BucketKey::new(Timeframe::M1, day),
                     &format!(
                         "/tmp/dukascopy/EURUSD/{}/{:02}/{:02}/BID_candles_min_1.bi5",
                         day.year(),
@@ -441,17 +415,13 @@ mod tests {
                         day.day()
                     ),
                     &i.to_string(),
-                );
-                task.bucket = BucketKey::new(Timeframe::M1, day);
-                task
+                )
             })
             .collect()
     }
 
     fn tasks(n: usize) -> Vec<DownloadTask> {
-        (0..n)
-            .map(|i| task_named("EURUSD", &i.to_string()))
-            .collect()
+        (0..n).map(|i| task_named(&i.to_string())).collect()
     }
 
     fn client() -> reqwest::Client {
@@ -472,8 +442,8 @@ mod tests {
             .into()
     }
 
-    fn gate(n: usize) -> Arc<Semaphore> {
-        Arc::new(Semaphore::new(n))
+    fn gate(n: usize) -> DownloadGate {
+        DownloadGate::new(NonZeroUsize::new(n).expect("test gate is non-zero"))
     }
 
     fn boom() -> AppError {
@@ -490,6 +460,28 @@ mod tests {
         }
     }
 
+    /// Assert the five counters in one go, so a failure names the whole row.
+    #[track_caller]
+    fn assert_stats(
+        stats: DownloadStats,
+        total: usize,
+        ok: usize,
+        not_found: usize,
+        failed: usize,
+        skipped: usize,
+    ) {
+        assert_eq!(
+            (
+                stats.total(),
+                stats.ok(),
+                stats.not_found(),
+                stats.failed(),
+                stats.skipped()
+            ),
+            (total, ok, not_found, failed, skipped)
+        );
+    }
+
     /// Runs `f`, asserting it behaved like `always_ok`.
     async fn ok_with<F, Fut>(f: F) -> DownloadStats
     where
@@ -497,7 +489,7 @@ mod tests {
         Fut: Future<Output = Result<(), AppError>>,
     {
         let tasks = tasks(1);
-        run_downloads_inner(&client(), tasks, 16, &gate(16), f)
+        run_downloads_inner(&client(), tasks, &gate(16), f)
             .await
             .unwrap()
     }
@@ -509,7 +501,6 @@ mod tests {
         let stats = run_downloads_inner(
             &client(),
             vec![],
-            16,
             &gate(16),
             |_: reqwest::Client, _: DownloadTask| async { unreachable!("no task runs") },
         )
@@ -526,7 +517,6 @@ mod tests {
         let stats = run_downloads_inner(
             &client(),
             tasks(2),
-            16,
             &gate(16),
             move |_: reqwest::Client, _: DownloadTask| {
                 let counter = counter.clone();
@@ -540,16 +530,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            stats,
-            DownloadStats {
-                total: 2,
-                ok: 2,
-                not_found: 0,
-                failed: 0,
-                skipped: 0
-            }
-        );
+        assert_stats(stats, 2, 2, 0, 0, 0);
     }
 
     #[tokio::test]
@@ -557,11 +538,12 @@ mod tests {
         let stats = run_downloads_inner(
             &client(),
             tasks(2),
-            16,
             &gate(16),
             |_: reqwest::Client, t: DownloadTask| async move {
-                if t.url.ends_with('0') {
-                    Err(AppError::NotFound { url: t.url })
+                if t.url().ends_with('0') {
+                    Err(AppError::NotFound {
+                        url: t.url().to_string(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -570,16 +552,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            stats,
-            DownloadStats {
-                total: 2,
-                ok: 1,
-                not_found: 1,
-                failed: 0,
-                skipped: 0
-            }
-        );
+        assert_stats(stats, 2, 1, 1, 0, 0);
     }
 
     /// A batch where every file is missing is an unavailable range, even when
@@ -589,7 +562,6 @@ mod tests {
         let err = run_downloads_inner(
             &client(),
             daily_tasks(2),
-            16,
             &gate(16),
             |_: reqwest::Client, _: DownloadTask| async {
                 Err(AppError::NotFound {
@@ -639,12 +611,11 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(2),
-                16,
                 &gate(16),
                 |_: reqwest::Client, t: DownloadTask| async move {
-                    if t.url.ends_with('1') {
+                    if t.url().ends_with('1') {
                         Err(AppError::DownloadFailed {
-                            url: t.url,
+                            url: t.url().to_string(),
                             reason: "HTTP 500".into(),
                         })
                     } else {
@@ -667,13 +638,12 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(3),
-                16,
                 &gate(16),
                 |_: reqwest::Client, t: DownloadTask| async move {
-                    match t.url.as_str() {
-                        u if u.ends_with("/0") => Err(AppError::NotFound { url: t.url }),
+                    match t.url() {
+                        u if u.ends_with("/0") => Err(AppError::NotFound { url: u.into() }),
                         u if u.ends_with("/1") => Err(AppError::DownloadFailed {
-                            url: t.url,
+                            url: u.into(),
                             reason: "bad".into(),
                         }),
                         _ => Ok(()),
@@ -697,7 +667,6 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(n),
-                1,
                 &gate(1),
                 |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
             )
@@ -741,7 +710,6 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(100),
-                30,
                 &gate(30),
                 move |_: reqwest::Client, _: DownloadTask| {
                     let counter = counter.clone();
@@ -785,7 +753,6 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(100),
-                1,
                 &gate(1),
                 move |_: reqwest::Client, _: DownloadTask| {
                     let counter = counter.clone();
@@ -819,7 +786,6 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(200),
-                1,
                 &gate(1),
                 |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
             )
@@ -852,13 +818,18 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(300),
-                1,
                 &gate(1),
                 move |_: reqwest::Client, t: DownloadTask| {
                     let counter = counter.clone();
                     async move {
                         counter.fetch_add(1, Ordering::SeqCst);
-                        let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                        let i: usize = t
+                            .url()
+                            .rsplit('/')
+                            .next()
+                            .expect("test URL has a tag")
+                            .parse()
+                            .expect("tag is a number");
                         if i % 2 == 0 { Err(boom()) } else { Ok(()) }
                     }
                 },
@@ -890,10 +861,15 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(100),
-                1,
                 &gate(1),
                 |_: reqwest::Client, t: DownloadTask| async move {
-                    let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                    let i: usize = t
+                        .url()
+                        .rsplit('/')
+                        .next()
+                        .expect("test URL has a tag")
+                        .parse()
+                        .expect("tag is a number");
                     if i % 10 == 0 { Err(boom()) } else { Ok(()) }
                 },
             )
@@ -924,7 +900,6 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(200),
-                1,
                 &gate(1),
                 |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
             )
@@ -952,12 +927,19 @@ mod tests {
         let stats = run_downloads_inner(
             &client(),
             tasks(40),
-            1,
             &gate(1),
             |_: reqwest::Client, t: DownloadTask| async move {
-                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                let i: usize = t
+                    .url()
+                    .rsplit('/')
+                    .next()
+                    .expect("test URL has a tag")
+                    .parse()
+                    .expect("tag is a number");
                 if i % 20 == 0 {
-                    Err(AppError::NotFound { url: t.url })
+                    Err(AppError::NotFound {
+                        url: t.url().to_string(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -968,9 +950,7 @@ mod tests {
 
         // 404s are expected answers, not failures: the breaker stays shut and
         // every file is attempted.
-        assert_eq!(stats.not_found, 2);
-        assert_eq!(stats.ok, 38);
-        assert_eq!(stats.skipped, 0);
+        assert_stats(stats, 40, 38, 2, 0, 0);
     }
 
     // — missing-range verdicts —
@@ -982,12 +962,19 @@ mod tests {
         let err = run_downloads_inner(
             &client(),
             daily_tasks(20),
-            16,
             &gate(16),
             |_: reqwest::Client, t: DownloadTask| async move {
-                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                let i: usize = t
+                    .url()
+                    .rsplit('/')
+                    .next()
+                    .expect("test URL has a tag")
+                    .parse()
+                    .expect("tag is a number");
                 if i < 10 {
-                    Err(AppError::NotFound { url: t.url })
+                    Err(AppError::NotFound {
+                        url: t.url().to_string(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -1018,7 +1005,6 @@ mod tests {
         let err = run_downloads_inner(
             &client(),
             daily_tasks(20),
-            16,
             &gate(16),
             |_: reqwest::Client, _: DownloadTask| async {
                 Err(AppError::NotFound { url: "u".into() })
@@ -1047,12 +1033,19 @@ mod tests {
         let stats = run_downloads_inner(
             &client(),
             daily_tasks(100),
-            16,
             &gate(16),
             |_: reqwest::Client, t: DownloadTask| async move {
-                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                let i: usize = t
+                    .url()
+                    .rsplit('/')
+                    .next()
+                    .expect("test URL has a tag")
+                    .parse()
+                    .expect("tag is a number");
                 if i % 20 == 0 {
-                    Err(AppError::NotFound { url: t.url })
+                    Err(AppError::NotFound {
+                        url: t.url().to_string(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -1061,9 +1054,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(stats.not_found, 5);
-        assert_eq!(stats.ok, 95);
-        assert_eq!(stats.failed, 0);
+        assert_stats(stats, 100, 95, 5, 0, 0);
     }
 
     /// A tiny batch that downloaded nothing is still an unavailable range:
@@ -1074,7 +1065,6 @@ mod tests {
         let err = run_downloads_inner(
             &client(),
             daily_tasks(3),
-            16,
             &gate(16),
             |_: reqwest::Client, _: DownloadTask| async {
                 Err(AppError::NotFound {
@@ -1091,8 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn all_ok_shortcut_helper_reports_success() {
         let stats = ok_with(|_: reqwest::Client, _: DownloadTask| async { Ok(()) }).await;
-        assert_eq!(stats.ok, 1);
-        assert_eq!(stats.total, 1);
+        assert_stats(stats, 1, 1, 0, 0, 0);
     }
 
     // — the "allow missing" opt-out —
@@ -1103,13 +1092,20 @@ mod tests {
         let err = run_downloads_inner_with(
             &client(),
             daily_tasks(20),
-            16,
             &gate(16),
             DownloadOptions::default(),
             |_: reqwest::Client, t: DownloadTask| async move {
-                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                let i: usize = t
+                    .url()
+                    .rsplit('/')
+                    .next()
+                    .expect("test URL has a tag")
+                    .parse()
+                    .expect("tag is a number");
                 if i < 10 {
-                    Err(AppError::NotFound { url: t.url })
+                    Err(AppError::NotFound {
+                        url: t.url().to_string(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -1128,15 +1124,20 @@ mod tests {
         let stats = run_downloads_inner_with(
             &client(),
             daily_tasks(20),
-            16,
             &gate(16),
-            DownloadOptions {
-                allow_missing: true,
-            },
+            DownloadOptions::new().with_allow_missing(true),
             |_: reqwest::Client, t: DownloadTask| async move {
-                let i: usize = t.url.rsplit('/').next().unwrap().parse().unwrap();
+                let i: usize = t
+                    .url()
+                    .rsplit('/')
+                    .next()
+                    .expect("test URL has a tag")
+                    .parse()
+                    .expect("tag is a number");
                 if i < 10 {
-                    Err(AppError::NotFound { url: t.url })
+                    Err(AppError::NotFound {
+                        url: t.url().to_string(),
+                    })
                 } else {
                     Ok(())
                 }
@@ -1145,9 +1146,7 @@ mod tests {
         .await
         .expect("the range check is relaxed, the batch must succeed");
 
-        assert_eq!(stats.not_found, 10);
-        assert_eq!(stats.ok, 10);
-        assert_eq!(stats.failed, 0);
+        assert_stats(stats, 20, 10, 10, 0, 0);
     }
 
     /// Even an all-missing batch succeeds when the opt-out is set: the
@@ -1157,11 +1156,8 @@ mod tests {
         let stats = run_downloads_inner_with(
             &client(),
             daily_tasks(3),
-            16,
             &gate(16),
-            DownloadOptions {
-                allow_missing: true,
-            },
+            DownloadOptions::new().with_allow_missing(true),
             |_: reqwest::Client, _: DownloadTask| async {
                 Err(AppError::NotFound {
                     url: "http://x".into(),
@@ -1171,9 +1167,7 @@ mod tests {
         .await
         .expect("the range check is relaxed, the batch must succeed");
 
-        assert_eq!(stats.total, 3);
-        assert_eq!(stats.not_found, 3);
-        assert_eq!(stats.ok, 0);
+        assert_stats(stats, 3, 0, 3, 0, 0);
     }
 
     /// The opt-out covers the *range* checks only. A file that actually
@@ -1183,11 +1177,8 @@ mod tests {
         let err = run_downloads_inner_with(
             &client(),
             daily_tasks(20),
-            16,
             &gate(16),
-            DownloadOptions {
-                allow_missing: true,
-            },
+            DownloadOptions::new().with_allow_missing(true),
             |_: reqwest::Client, _: DownloadTask| async { Err(boom()) },
         )
         .await
@@ -1213,7 +1204,6 @@ mod tests {
                 run_downloads_inner(
                     &reqwest::Client::new(),
                     tasks(10),
-                    16, // per-pair bound is far above the gate
                     &gate,
                     move |_: reqwest::Client, _: DownloadTask| {
                         let active = active.clone();
@@ -1231,7 +1221,9 @@ mod tests {
             }));
         }
         for p in pairs {
-            p.await.unwrap().unwrap();
+            p.await
+                .expect("pair task must not panic")
+                .expect("pair batch must succeed");
         }
 
         assert_eq!(
@@ -1242,7 +1234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrency_one_runs_sequentially() {
+    async fn a_single_permit_runs_sequentially() {
         let active = Arc::new(Counter::new(0));
         let peak = Arc::new(Counter::new(0));
         let in_flight = active.clone();
@@ -1251,8 +1243,7 @@ mod tests {
         let stats = run_downloads_inner(
             &client(),
             tasks(5),
-            1,
-            &gate(16),
+            &gate(1),
             move |_: reqwest::Client, _: DownloadTask| {
                 let in_flight = in_flight.clone();
                 let p = p.clone();
@@ -1268,22 +1259,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(stats.ok, 5);
+        assert_stats(stats, 5, 5, 0, 0, 0);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn zero_concurrency_still_makes_progress() {
-        let stats = run_downloads_inner(
-            &client(),
-            tasks(1),
-            0,
-            &gate(1),
-            |_: reqwest::Client, _: DownloadTask| async { Ok(()) },
-        )
-        .await
-        .unwrap();
-        assert_eq!(stats.ok, 1);
     }
 
     // — breaker semantics under concurrency —
@@ -1296,7 +1273,6 @@ mod tests {
             run_downloads_inner(
                 &client(),
                 tasks(200),
-                30,
                 &gate(30),
                 |_: reqwest::Client, _: DownloadTask| async {
                     // A real download awaits the network; without an await

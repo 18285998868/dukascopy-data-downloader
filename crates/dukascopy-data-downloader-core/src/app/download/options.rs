@@ -12,27 +12,55 @@
 ///
 /// ```
 /// // The default is strict.
-/// assert!(!ddd::DownloadOptions::default().allow_missing);
+/// assert!(!ddd::DownloadOptions::default().allow_missing());
 ///
 /// // The opt-out is explicit.
-/// let opts = ddd::DownloadOptions {
-///     allow_missing: true,
-/// };
-/// assert!(opts.allow_missing);
+/// let opts = ddd::DownloadOptions::new().with_allow_missing(true);
+/// assert!(opts.allow_missing());
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DownloadOptions {
+    allow_missing: bool,
+}
+
+impl DownloadOptions {
+    /// Strict options: a range the feed does not have fails the batch.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            allow_missing: false,
+        }
+    }
+
     /// Tolerate a requested range that is missing from the data feed.
-    ///
-    /// When `false` (the default) a batch whose range is largely absent
-    /// fails with [`crate::AppError::RangeUnavailable`]. When `true` the same
-    /// situation is only logged and the run finishes with whatever the feed
-    /// did have.
-    ///
-    /// This covers the *range* checks only — the share of 404s, the longest
-    /// consecutive gap, and the case where every requested file is missing.
-    /// A file that actually failed to download (a transport error, a 5xx
-    /// that outlived the retry budget) still fails the batch: that is a
-    /// broken download, not a range the feed lacks.
-    pub allow_missing: bool,
+    #[must_use]
+    pub const fn with_allow_missing(mut self, allow_missing: bool) -> Self {
+        self.allow_missing = allow_missing;
+        self
+    }
+
+    /// Whether the range checks are relaxed.
+    #[must_use]
+    pub const fn allow_missing(&self) -> bool {
+        self.allow_missing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_strict() {
+        assert!(!DownloadOptions::default().allow_missing());
+        assert!(!DownloadOptions::new().allow_missing());
+    }
+
+    #[test]
+    fn the_builder_sets_and_clears_the_opt_out() {
+        let opts = DownloadOptions::new().with_allow_missing(true);
+        assert!(opts.allow_missing());
+        assert!(!opts.with_allow_missing(false).allow_missing());
+    }
 }

@@ -72,41 +72,41 @@ pub(super) fn range_verdict(
     // reporting success would be actively misleading, because the run
     // downloaded nothing while exiting with a success status.
     let longest_run = longest_missing_run(missing_buckets);
-    if stats.total >= MIN_SAMPLES_FOR_NOT_FOUND_RATIO {
+    if stats.total() >= MIN_SAMPLES_FOR_NOT_FOUND_RATIO {
         let ratio = cmp_ratio(
-            stats.not_found,
-            stats.total,
+            stats.not_found(),
+            stats.total(),
             NOT_FOUND_FAIL_NUM,
             NOT_FOUND_FAIL_DEN,
         );
         if ratio == std::cmp::Ordering::Greater {
-            if opts.allow_missing {
+            if opts.allow_missing() {
                 tracing::warn!(
-                    not_found = stats.not_found,
-                    total = stats.total,
+                    not_found = stats.not_found(),
+                    total = stats.total(),
                     longest_run,
                     "a large part of the requested range is missing from the data feed; \
                      continuing because missing data was allowed",
                 );
             } else {
                 return Err(AppError::RangeUnavailable {
-                    not_found: stats.not_found,
-                    total: stats.total,
+                    not_found: stats.not_found(),
+                    total: stats.total(),
                     longest_run,
                 });
             }
         }
         let ratio = cmp_ratio(
-            stats.not_found,
-            stats.total,
+            stats.not_found(),
+            stats.total(),
             NOT_FOUND_WARN_NUM,
             NOT_FOUND_WARN_DEN,
         );
         if ratio == std::cmp::Ordering::Greater {
             tracing::warn!(
-                not_found = stats.not_found,
-                total = stats.total,
-                ratio = %format!("{}/{}", stats.not_found, stats.total),
+                not_found = stats.not_found(),
+                total = stats.total(),
+                ratio = %format!("{}/{}", stats.not_found(), stats.total()),
                 "a noticeable share of the requested range is missing from the data feed",
             );
         }
@@ -115,18 +115,18 @@ pub(super) fn range_verdict(
     // problem even when the overall ratio is modest: the feed does not have
     // that stretch of the range at all.
     if longest_run >= MISSING_RUN_FAIL_LEN {
-        if opts.allow_missing {
+        if opts.allow_missing() {
             tracing::warn!(
-                not_found = stats.not_found,
-                total = stats.total,
+                not_found = stats.not_found(),
+                total = stats.total(),
                 longest_run,
                 "a long stretch of the requested range is missing from the data feed; \
                  continuing because missing data was allowed",
             );
         } else {
             return Err(AppError::RangeUnavailable {
-                not_found: stats.not_found,
-                total: stats.total,
+                not_found: stats.not_found(),
+                total: stats.total(),
                 longest_run,
             });
         }
@@ -138,25 +138,25 @@ pub(super) fn range_verdict(
     // through and exit successfully having downloaded nothing — exactly the
     // outcome `RangeUnavailable` exists to prevent. This check does not care
     // about the sample size: "nothing at all" is unambiguous at any size.
-    if stats.ok == 0 && stats.not_found == stats.total {
-        if opts.allow_missing {
+    if stats.ok() == 0 && stats.not_found() == stats.total() {
+        if opts.allow_missing() {
             tracing::warn!(
-                not_found = stats.not_found,
-                total = stats.total,
+                not_found = stats.not_found(),
+                total = stats.total(),
                 longest_run,
                 "every requested file is missing from the data feed; \
                  continuing because missing data was allowed",
             );
         } else {
             tracing::error!(
-                not_found = stats.not_found,
-                total = stats.total,
+                not_found = stats.not_found(),
+                total = stats.total(),
                 longest_run,
                 "every requested file is missing from the data feed",
             );
             return Err(AppError::RangeUnavailable {
-                not_found: stats.not_found,
-                total: stats.total,
+                not_found: stats.not_found(),
+                total: stats.total(),
                 longest_run,
             });
         }

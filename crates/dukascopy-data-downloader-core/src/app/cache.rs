@@ -49,7 +49,7 @@ fn cache_key(rel: &Path) -> String {
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), ddd::AppError> {
-/// let cached = ddd::utils::scan_local_files::scan_local_files(std::path::Path::new("data")).await?;
+/// let cached = ddd::scan_local_files(std::path::Path::new("data")).await?;
 /// println!("{} cached files", cached.len());
 /// # Ok(())
 /// # }
@@ -277,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn the_run_lock_directory_is_not_reported_as_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = crate::utils::run_lock::acquire_run_lock(dir.path()).unwrap();
+        let lock = crate::app::lock::acquire_run_lock(dir.path()).unwrap();
         write(
             &dir.path()
                 .join("dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),

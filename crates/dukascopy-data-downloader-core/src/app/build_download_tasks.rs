@@ -8,13 +8,14 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::build_urls::build_urls;
-use crate::config::{DownloadTask, PriceType, Symbol, Timeframe};
+use crate::app::download::DownloadTask;
+use crate::config::{PriceType, Symbol, Timeframe};
 
 /// Build a list of `DownloadTask`s for a date range, skipping locally-present files.
 ///
 /// `local` holds `output_dir`-relative paths (e.g.
 /// `dukascopy/EURUSD/2025/BID_candles_day_1.bi5`) as produced by
-/// [`crate::utils::scan_local_files::scan_local_files`].
+/// [`crate::app::cache::scan_local_files`].
 ///
 /// The cache set is generic over its hasher so a caller is free to use a
 /// cheaper one than the default `RandomState`.
@@ -36,10 +37,10 @@ use crate::config::{DownloadTask, PriceType, Symbol, Timeframe};
 ///
 /// assert_eq!(tasks.len(), 1);
 /// assert_eq!(
-///     tasks[0].dest,
+///     tasks[0].dest(),
 ///     Path::new("/tmp/data/dukascopy/EURUSD/2025/BID_candles_day_1.bi5")
 /// );
-/// assert_eq!(tasks[0].symbol, symbol);
+/// assert_eq!(tasks[0].symbol(), &symbol);
 /// ```
 #[must_use]
 pub fn build_download_tasks<S: std::hash::BuildHasher>(
@@ -53,11 +54,13 @@ pub fn build_download_tasks<S: std::hash::BuildHasher>(
 ) -> Vec<DownloadTask> {
     build_urls(symbol, price_type, timeframe, start, end)
         .filter(|dl| !local.contains(&dl.rel_path))
-        .map(|dl| DownloadTask {
-            url: dl.url,
-            dest: data_dir.join(&dl.rel_path),
-            symbol: symbol.clone(),
-            bucket: dl.bucket,
+        .map(|dl| {
+            DownloadTask::new(
+                dl.url,
+                data_dir.join(&dl.rel_path),
+                symbol.clone(),
+                dl.bucket,
+            )
         })
         .collect()
 }
@@ -81,7 +84,7 @@ mod tests {
     fn dests(tasks: &[DownloadTask]) -> Vec<String> {
         tasks
             .iter()
-            .map(|t| t.dest.to_string_lossy().into_owned())
+            .map(|t| t.dest().to_string_lossy().into_owned())
             .collect()
     }
 
@@ -108,10 +111,10 @@ mod tests {
             &HashSet::new(),
         );
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].symbol, sym("EURUSD"));
+        assert_eq!(tasks[0].symbol(), &sym("EURUSD"));
         assert_eq!(tasks[0].timeframe(), Timeframe::D1);
         assert_eq!(
-            tasks[0].dest,
+            tasks[0].dest(),
             Path::new("/tmp/dukascopy/EURUSD/2025/BID_candles_day_1.bi5")
         );
     }
@@ -178,7 +181,7 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert!(
             tasks[0]
-                .dest
+                .dest()
                 .to_string_lossy()
                 .contains("ASK_candles_day_1.bi5")
         );
@@ -212,10 +215,10 @@ mod tests {
         let feed_prefix = format!("{}/", crate::app::build_urls::FEED_BASE);
         for t in &tasks {
             let suffix = t
-                .url
+                .url()
                 .strip_prefix(&feed_prefix)
                 .expect("url uses the documented feed base");
-            assert_eq!(t.dest, Path::new("/tmp/dukascopy").join(suffix));
+            assert_eq!(t.dest(), Path::new("/tmp/dukascopy").join(suffix));
         }
     }
 }

@@ -23,7 +23,7 @@ use backon::Retryable as _;
 
 /// Elapsed-time budget for retrying a single file.
 ///
-/// Deliberately ~4x the per-request timeout in `app::build_client`: a single
+/// Deliberately ~4x the per-request timeout in `app::client`: a single
 /// stalled attempt must not be able to consume the entire retry window, or the
 /// retry policy silently degrades into "try once".
 pub(crate) const MAX_ELAPSED_SECS: u64 = 120;

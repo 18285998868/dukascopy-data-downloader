@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
-use crate::config::DownloadTask;
-use crate::utils::backoff::{Retry, RetryError, default_retry};
+use crate::app::download::DownloadTask;
+
+use super::retry::{Retry, RetryError, default_retry};
 
 /// Download a bi5 file with retry, streaming directly to disk.
 ///
@@ -29,20 +30,21 @@ use crate::utils::backoff::{Retry, RetryError, default_retry};
 ///
 /// ```no_run
 /// # use std::path::PathBuf;
-/// # use ddd::config::{BucketKey, DownloadTask, Symbol, Timeframe};
+/// # use ddd::config::{BucketKey, Symbol, Timeframe};
+/// # use ddd::DownloadTask;
 /// # async fn example() -> Result<(), ddd::AppError> {
 /// let client = reqwest::Client::new();
 /// let bucket = BucketKey::new(
 ///     Timeframe::D1,
 ///     chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
 /// );
-/// let task = DownloadTask {
-///     url: "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/BID_candles_day_1.bi5"
+/// let task = DownloadTask::new(
+///     "https://datafeed.dukascopy.com/datafeed/EURUSD/2025/BID_candles_day_1.bi5"
 ///         .to_string(),
-///     dest: PathBuf::from("/tmp/dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),
-///     symbol: Symbol::new("EURUSD")?,
+///     PathBuf::from("/tmp/dukascopy/EURUSD/2025/BID_candles_day_1.bi5"),
+///     Symbol::new("EURUSD")?,
 ///     bucket,
-/// };
+/// );
 ///
 /// ddd::app::download::stream::download_to_file(&client, &task).await
 /// # }
@@ -244,8 +246,8 @@ async fn download_to_file_with_backoff(
     let budget = retry.budget();
     let op = || {
         let c = client.clone();
-        let u = task.url.clone();
-        let dest = task.dest.clone();
+        let u = task.url().to_string();
+        let dest = task.dest().to_path_buf();
         async move {
             let mut resp = match c.get(&u).send().await {
                 Ok(r) => r,
@@ -290,7 +292,6 @@ mod tests {
     use super::*;
     use crate::AppError;
     use crate::config::{BucketKey, Symbol, Timeframe};
-    use crate::utils::backoff::{RetryPolicy, default_policy};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -298,6 +299,8 @@ mod tests {
     use wiremock::Request;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::super::retry::{RetryPolicy, default_policy};
 
     /// Retry whose budget is already exhausted: it never retries.
     fn no_retry() -> Retry {
@@ -325,15 +328,15 @@ mod tests {
     const URL_PATH: &str = "/datafeed/EURUSD/2025/BID_candles_day_1.bi5";
 
     fn task(server: &MockServer, dest: &std::path::Path) -> DownloadTask {
-        DownloadTask {
-            url: format!("{}{URL_PATH}", server.uri()),
-            dest: dest.to_path_buf(),
-            symbol: Symbol::new("EURUSD").unwrap(),
-            bucket: BucketKey::new(
+        DownloadTask::new(
+            format!("{}{URL_PATH}", server.uri()),
+            dest.to_path_buf(),
+            Symbol::new("EURUSD").unwrap(),
+            BucketKey::new(
                 Timeframe::D1,
                 chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             ),
-        }
+        )
     }
 
     async fn server_returning(resp: ResponseTemplate) -> MockServer {
