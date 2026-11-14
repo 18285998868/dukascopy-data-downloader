@@ -411,7 +411,7 @@ mod tests {
                     &format!(
                         "/tmp/dukascopy/EURUSD/{}/{:02}/{:02}/BID_candles_min_1.bi5",
                         day.year(),
-                        day.month(),
+                        day.month() - 1,
                         day.day()
                     ),
                     &i.to_string(),

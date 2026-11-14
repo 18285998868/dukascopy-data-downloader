@@ -6,6 +6,7 @@
 
 ### Changed
 
+- **破坏性变更**：归档路径月份改为 0-based（`00` = 1 月，`11` = 12 月），与 Dukascopy datafeed 及 reader 的路径解析一致；年、日仍为 1-based。2023 年 7 月现在写入 `2023/06/`。
 - 日历统一到 `BucketKey`：`BucketKey::end()` / `next()`、`buckets_between`、`last_closed_day` 成为唯一日历来源；`build_urls` 只负责渲染 URL 与本地路径。
 - `AppConfig` 字段私有，新增 `symbols()` / `timeframes()` / `price_type()` / `start()` / `end()` / `output_dir()` / `concurrency()`（`NonZeroUsize`）与 `from_toml_str`；反序列化改由私有 `RawConfig` 承担，校验集中在 `TryFrom`。
 - `DownloadTask` 迁到 `app::download`：字段私有，使用 `DownloadTask::new` 与读取器，并标记 `#[non_exhaustive]`。
@@ -25,6 +26,7 @@
 
 ### Migration
 
+- 旧版本缓存的 `H1`/`M1` 文件按 1-based 月份落盘，升级后不会再被识别为缓存。要么删除并重新下载，要么把 `YYYY/MM` 的 `MM` 减一后移动；`D1` 不受影响。
 - `cfg.symbol` → `cfg.symbols()`；`cfg.timeframe` → `cfg.timeframes()`；`cfg.price_type` → `cfg.price_type()`；`cfg.output_dir` → `cfg.output_dir()`；`cfg.concurrency` → `cfg.concurrency().get()`。
 - `DownloadTask { .. }` → `DownloadTask::new(url, dest, symbol, bucket)`；字段读取改为 `url()` / `dest()` / `symbol()` / `bucket()`。
 - `run_downloads(client, tasks, n, &gate)` → `run_downloads(client, tasks, &DownloadGate::new(n))`。

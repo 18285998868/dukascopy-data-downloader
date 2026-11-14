@@ -103,7 +103,7 @@ mod tests {
     ///
     /// A `D1` run of three years and an `M1` run of three days are both
     /// three buckets long, but they are not comparable: mixing the two key
-    /// spaces would sort `"2025"` next to `"2025/06/15"` and call the pair
+    /// spaces would sort `"2025"` next to `"2025/05/15"` and call the pair
     /// non-adjacent, splitting both runs in two.
     #[test]
     fn the_run_is_measured_per_timeframe() {

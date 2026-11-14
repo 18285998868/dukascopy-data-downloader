@@ -4,6 +4,10 @@
 //! Dukascopy file: which days a bucket covers, how buckets advance, and where
 //! the last *closed* bucket ends. URL rendering and cache paths derive their
 //! date components from [`BucketKey`] instead of re-implementing the calendar.
+//!
+//! [`BucketKey`] stores logical calendar dates, but its `Display` renders the
+//! archive path, whose **month is zero-based** (`00` = January, `11` =
+//! December) exactly like Dukascopy's datafeed. Years and days stay one-based.
 
 use std::fmt;
 
@@ -35,7 +39,7 @@ impl BucketKey {
     /// let date = chrono::NaiveDate::from_ymd_opt(2025, 6, 15).unwrap();
     /// let key = BucketKey::new(Timeframe::H1, date);
     /// assert_eq!(key.start(), chrono::NaiveDate::from_ymd_opt(2025, 6, 1).unwrap());
-    /// assert_eq!(key.to_string(), "2025/06");
+    /// assert_eq!(key.to_string(), "2025/05");
     /// ```
     #[must_use]
     pub fn new(timeframe: Timeframe, date: NaiveDate) -> Self {
@@ -148,18 +152,25 @@ impl BucketKey {
             start,
         })
     }
+
+    /// Archive month component: Dukascopy counts months from zero.
+    fn path_month(self) -> u32 {
+        // INVARIANT: `NaiveDate` months are always 1..=12.
+        self.start.month().saturating_sub(1)
+    }
 }
 
 impl fmt::Display for BucketKey {
+    /// Renders the archive path with a zero-based month.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.timeframe {
             Timeframe::D1 => write!(f, "{:04}", self.start.year()),
-            Timeframe::H1 => write!(f, "{:04}/{:02}", self.start.year(), self.start.month()),
+            Timeframe::H1 => write!(f, "{:04}/{:02}", self.start.year(), self.path_month()),
             Timeframe::M1 => write!(
                 f,
                 "{:04}/{:02}/{:02}",
                 self.start.year(),
-                self.start.month(),
+                self.path_month(),
                 self.start.day()
             ),
         }
@@ -258,18 +269,22 @@ mod tests {
     }
 
     #[test]
-    fn display_uses_the_server_layout() {
+    fn display_uses_the_zero_based_month() {
         assert_eq!(
             BucketKey::new(Timeframe::D1, date(2025, 6, 15)).to_string(),
             "2025"
         );
         assert_eq!(
             BucketKey::new(Timeframe::H1, date(2025, 6, 15)).to_string(),
-            "2025/06"
+            "2025/05"
+        );
+        assert_eq!(
+            BucketKey::new(Timeframe::H1, date(2025, 12, 15)).to_string(),
+            "2025/11"
         );
         assert_eq!(
             BucketKey::new(Timeframe::M1, date(2007, 1, 2)).to_string(),
-            "2007/01/02"
+            "2007/00/02"
         );
     }
 
@@ -339,12 +354,12 @@ mod tests {
         let h1: Vec<_> = buckets_between(Timeframe::H1, date(2025, 1, 1), date(2025, 3, 31))
             .map(|b| b.to_string())
             .collect();
-        assert_eq!(h1, vec!["2025/01", "2025/02", "2025/03"]);
+        assert_eq!(h1, vec!["2025/00", "2025/01", "2025/02"]);
 
         let m1: Vec<_> = buckets_between(Timeframe::M1, date(2025, 1, 1), date(2025, 1, 3))
             .map(|b| b.to_string())
             .collect();
-        assert_eq!(m1, vec!["2025/01/01", "2025/01/02", "2025/01/03"]);
+        assert_eq!(m1, vec!["2025/00/01", "2025/00/02", "2025/00/03"]);
     }
 
     #[test]
@@ -353,7 +368,7 @@ mod tests {
             buckets_between(Timeframe::H1, date(2024, 11, 15), date(2025, 2, 3))
                 .map(|b| b.to_string())
                 .collect();
-        assert_eq!(collected, vec!["2024/11", "2024/12", "2025/01", "2025/02"]);
+        assert_eq!(collected, vec!["2024/10", "2024/11", "2025/00", "2025/01"]);
 
         let collected: Vec<_> =
             buckets_between(Timeframe::M1, date(2024, 12, 30), date(2025, 1, 2))
@@ -361,7 +376,7 @@ mod tests {
                 .collect();
         assert_eq!(
             collected,
-            vec!["2024/12/30", "2024/12/31", "2025/01/01", "2025/01/02"]
+            vec!["2024/11/30", "2024/11/31", "2025/00/01", "2025/00/02"]
         );
     }
 
@@ -383,7 +398,7 @@ mod tests {
             .take(3)
             .map(|b| b.to_string())
             .collect();
-        assert_eq!(first, vec!["2020/01/01", "2020/01/02", "2020/01/03"]);
+        assert_eq!(first, vec!["2020/00/01", "2020/00/02", "2020/00/03"]);
     }
 
     // — closed buckets —

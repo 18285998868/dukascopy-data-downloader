@@ -13,7 +13,7 @@ use ddd::{DownloadGate, DownloadTask};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const URL_PATH: &str = "/datafeed/EURUSD/2025/06/BID_candles_hour_1.bi5";
+const URL_PATH: &str = "/datafeed/EURUSD/2025/05/BID_candles_hour_1.bi5";
 
 #[expect(
     clippy::unwrap_used,
@@ -49,7 +49,7 @@ async fn server_returning(resp: ResponseTemplate) -> MockServer {
 async fn a_successful_download_lands_at_its_destination() {
     let server = server_returning(ResponseTemplate::new(200).set_body_bytes(b"payload")).await;
     let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join("EURUSD/2025/06/BID_candles_hour_1.bi5");
+    let dest = dir.path().join("EURUSD/2025/05/BID_candles_hour_1.bi5");
 
     ddd::app::download::stream::download_to_file(
         &reqwest::Client::new(),
@@ -69,7 +69,7 @@ async fn a_successful_download_lands_at_its_destination() {
 async fn a_missing_file_is_reported_and_leaves_no_trace() {
     let server = server_returning(ResponseTemplate::new(404)).await;
     let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join("EURUSD/2025/06/BID_candles_hour_1.bi5");
+    let dest = dir.path().join("EURUSD/2025/05/BID_candles_hour_1.bi5");
 
     let err = ddd::app::download::stream::download_to_file(
         &reqwest::Client::new(),
@@ -111,7 +111,7 @@ async fn a_batch_of_only_404s_is_an_unavailable_range() {
 async fn an_empty_200_body_is_not_committed() {
     let server = server_returning(ResponseTemplate::new(200)).await;
     let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join("EURUSD/2025/06/BID_candles_hour_1.bi5");
+    let dest = dir.path().join("EURUSD/2025/05/BID_candles_hour_1.bi5");
 
     let err = ddd::app::download::stream::download_to_file(
         &reqwest::Client::new(),

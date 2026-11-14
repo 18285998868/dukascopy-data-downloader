@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn skips_only_the_cached_day() {
-        let local = local_with(&["dukascopy/EURUSD/2025/01/01/BID_candles_min_1.bi5"]);
+        let local = local_with(&["dukascopy/EURUSD/2025/00/01/BID_candles_min_1.bi5"]);
         let tasks = build(
             "EURUSD",
             Timeframe::M1,
@@ -147,8 +147,8 @@ mod tests {
         assert_eq!(
             dests(&tasks),
             vec![
-                "/tmp/dukascopy/EURUSD/2025/01/02/BID_candles_min_1.bi5",
-                "/tmp/dukascopy/EURUSD/2025/01/03/BID_candles_min_1.bi5",
+                "/tmp/dukascopy/EURUSD/2025/00/02/BID_candles_min_1.bi5",
+                "/tmp/dukascopy/EURUSD/2025/00/03/BID_candles_min_1.bi5",
             ]
         );
     }

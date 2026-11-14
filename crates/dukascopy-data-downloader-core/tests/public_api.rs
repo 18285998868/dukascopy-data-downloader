@@ -79,13 +79,13 @@ fn urls_destinations_and_task_metadata_stay_in_sync() {
     let task = &tasks[0];
     assert!(
         task.url()
-            .ends_with("/EURUSD/2025/06/BID_candles_hour_1.bi5"),
+            .ends_with("/EURUSD/2025/05/BID_candles_hour_1.bi5"),
         "{}",
         task.url()
     );
     assert_eq!(
         task.dest(),
-        Path::new("/out/dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5")
+        Path::new("/out/dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5")
     );
     assert_eq!(task.symbol().as_str(), "EURUSD");
     assert_eq!(task.timeframe(), Timeframe::H1);
@@ -98,13 +98,13 @@ async fn a_cached_file_is_never_downloaded_twice() {
     let dir = tempfile::tempdir().unwrap();
     let cached = dir
         .path()
-        .join("dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5");
+        .join("dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5");
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(&cached, b"payload").unwrap();
 
     let local = scan_local_files(dir.path()).await.unwrap();
     assert!(
-        local.contains("dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5"),
+        local.contains("dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5"),
         "{local:?}"
     );
 
@@ -127,7 +127,7 @@ async fn the_price_type_is_part_of_the_cache_key() {
     let dir = tempfile::tempdir().unwrap();
     let cached = dir
         .path()
-        .join("dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5");
+        .join("dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5");
     std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
     std::fs::write(&cached, b"payload").unwrap();
 
@@ -207,7 +207,7 @@ async fn a_mixed_timeframe_batch_is_analysed_per_timeframe() {
     tasks.push(ddd::DownloadTask::new(
         format!("{}/m1.bi5", server.uri()),
         dir.path()
-            .join("dukascopy/EURUSD/2023/06/15/BID_candles_min_1.bi5"),
+            .join("dukascopy/EURUSD/2023/05/15/BID_candles_min_1.bi5"),
         ddd::Symbol::new("EURUSD").unwrap(),
         BucketKey::new(
             ddd::Timeframe::M1,

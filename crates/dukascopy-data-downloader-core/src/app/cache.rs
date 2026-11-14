@@ -162,14 +162,14 @@ mod tests {
         );
         write(
             &dir.path()
-                .join("dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5"),
+                .join("dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5"),
             b"bi5",
         );
 
         let files = scan_local_files(dir.path()).await.unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.contains("dukascopy/EURUSD/2025/BID_candles_day_1.bi5"));
-        assert!(files.contains("dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5"));
+        assert!(files.contains("dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5"));
     }
 
     #[tokio::test]
@@ -267,9 +267,9 @@ mod tests {
     #[test]
     fn the_cache_key_keeps_every_component() {
         let key = cache_key(Path::new(
-            "dukascopy/EURUSD/2025/06/15/BID_candles_min_1.bi5",
+            "dukascopy/EURUSD/2025/05/15/BID_candles_min_1.bi5",
         ));
-        assert_eq!(key, "dukascopy/EURUSD/2025/06/15/BID_candles_min_1.bi5");
+        assert_eq!(key, "dukascopy/EURUSD/2025/05/15/BID_candles_min_1.bi5");
     }
 
     /// The run lock lives inside the output directory and must not be

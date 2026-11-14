@@ -93,7 +93,7 @@ pub(crate) fn server_path(symbol: &Symbol, price_type: PriceType, bucket: Bucket
 /// assert_eq!(urls.len(), 1);
 /// assert_eq!(
 ///     urls[0].rel_path,
-///     "dukascopy/EURUSD/2025/06/BID_candles_hour_1.bi5"
+///     "dukascopy/EURUSD/2025/05/BID_candles_hour_1.bi5"
 /// );
 /// ```
 pub fn build_urls(
@@ -169,11 +169,11 @@ mod tests {
         );
         assert_eq!(
             urls[0].url,
-            format!("{FEED_BASE}/EURUSD/2025/06/ASK_candles_hour_1.bi5")
+            format!("{FEED_BASE}/EURUSD/2025/05/ASK_candles_hour_1.bi5")
         );
         assert_eq!(
             urls[0].rel_path,
-            "dukascopy/EURUSD/2025/06/ASK_candles_hour_1.bi5"
+            "dukascopy/EURUSD/2025/05/ASK_candles_hour_1.bi5"
         );
     }
 
@@ -188,7 +188,7 @@ mod tests {
         );
         assert_eq!(
             urls[0].rel_path,
-            "dukascopy/EURUSD/2025/01/02/BID_candles_min_1.bi5"
+            "dukascopy/EURUSD/2025/00/02/BID_candles_min_1.bi5"
         );
     }
 
@@ -241,10 +241,10 @@ mod tests {
         assert_eq!(
             paths(&urls),
             vec![
-                "dukascopy/EURUSD/2024/12/30/BID_candles_min_1.bi5",
-                "dukascopy/EURUSD/2024/12/31/BID_candles_min_1.bi5",
-                "dukascopy/EURUSD/2025/01/01/BID_candles_min_1.bi5",
-                "dukascopy/EURUSD/2025/01/02/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2024/11/30/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2024/11/31/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2025/00/01/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2025/00/02/BID_candles_min_1.bi5",
             ]
         );
     }
@@ -261,9 +261,9 @@ mod tests {
         assert_eq!(
             paths(&urls),
             vec![
+                "dukascopy/EURUSD/2025/00/BID_candles_hour_1.bi5",
                 "dukascopy/EURUSD/2025/01/BID_candles_hour_1.bi5",
                 "dukascopy/EURUSD/2025/02/BID_candles_hour_1.bi5",
-                "dukascopy/EURUSD/2025/03/BID_candles_hour_1.bi5",
             ]
         );
     }
@@ -313,10 +313,10 @@ mod tests {
         assert_eq!(
             paths(&urls),
             vec![
+                "dukascopy/EURUSD/2024/10/BID_candles_hour_1.bi5",
                 "dukascopy/EURUSD/2024/11/BID_candles_hour_1.bi5",
-                "dukascopy/EURUSD/2024/12/BID_candles_hour_1.bi5",
+                "dukascopy/EURUSD/2025/00/BID_candles_hour_1.bi5",
                 "dukascopy/EURUSD/2025/01/BID_candles_hour_1.bi5",
-                "dukascopy/EURUSD/2025/02/BID_candles_hour_1.bi5",
             ]
         );
     }
@@ -349,9 +349,9 @@ mod tests {
         assert_eq!(
             paths(&first),
             vec![
-                "dukascopy/EURUSD/2020/01/01/BID_candles_min_1.bi5",
-                "dukascopy/EURUSD/2020/01/02/BID_candles_min_1.bi5",
-                "dukascopy/EURUSD/2020/01/03/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2020/00/01/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2020/00/02/BID_candles_min_1.bi5",
+                "dukascopy/EURUSD/2020/00/03/BID_candles_min_1.bi5",
             ]
         );
     }
@@ -391,7 +391,7 @@ mod tests {
                 PriceType::Ask,
                 BucketKey::new(Timeframe::H1, date(2024, 6, 15)),
             ),
-            "BTCUSD/2024/06/ASK_candles_hour_1.bi5"
+            "BTCUSD/2024/05/ASK_candles_hour_1.bi5"
         );
     }
 
@@ -403,7 +403,7 @@ mod tests {
                 PriceType::Bid,
                 BucketKey::new(Timeframe::M1, date(2024, 6, 15)),
             ),
-            "BTCUSD/2024/06/15/BID_candles_min_1.bi5"
+            "BTCUSD/2024/05/15/BID_candles_min_1.bi5"
         );
     }
 
@@ -415,7 +415,7 @@ mod tests {
                 PriceType::Bid,
                 BucketKey::new(Timeframe::M1, date(2007, 1, 2)),
             ),
-            "EURUSD/2007/01/02/BID_candles_min_1.bi5"
+            "EURUSD/2007/00/02/BID_candles_min_1.bi5"
         );
     }
 }
