@@ -44,7 +44,11 @@ run cargo test --workspace --doc --all-features "${locked[@]}"
 printf '==> cargo doc\n'
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features "${locked[@]}"
 
-run cargo bench --workspace --no-run "${locked[@]}"
+if compgen -G 'crates/*/benches/*.rs' >/dev/null; then
+    run cargo bench --workspace --no-run "${locked[@]}"
+else
+    printf '==> no benches; skipping cargo bench\n'
+fi
 
 missing=0
 for tool in cargo-deny cargo-audit; do
