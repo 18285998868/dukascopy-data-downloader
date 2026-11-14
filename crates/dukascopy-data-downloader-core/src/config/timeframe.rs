@@ -20,6 +20,23 @@ pub enum Timeframe {
     D1,
 }
 
+impl Timeframe {
+    /// Every timeframe this crate supports.
+    ///
+    /// Iterating this constant keeps calendar analysis and tests exhaustive
+    /// without listing the variants again at every call site.
+    pub const ALL: [Self; 3] = [Self::M1, Self::H1, Self::D1];
+
+    /// Server-side file stem for this timeframe.
+    pub(crate) const fn file_stem(self) -> &'static str {
+        match self {
+            Self::M1 => "candles_min_1",
+            Self::H1 => "candles_hour_1",
+            Self::D1 => "candles_day_1",
+        }
+    }
+}
+
 impl FromStr for Timeframe {
     type Err = AppError;
 
@@ -58,8 +75,15 @@ mod tests {
 
     #[test]
     fn timeframe_display_round_trips() {
-        for tf in [Timeframe::M1, Timeframe::H1, Timeframe::D1] {
+        for tf in Timeframe::ALL {
             assert_eq!(tf.to_string().parse::<Timeframe>().unwrap(), tf);
         }
+    }
+
+    #[test]
+    fn every_timeframe_has_a_server_file_stem() {
+        assert_eq!(Timeframe::M1.file_stem(), "candles_min_1");
+        assert_eq!(Timeframe::H1.file_stem(), "candles_hour_1");
+        assert_eq!(Timeframe::D1.file_stem(), "candles_day_1");
     }
 }

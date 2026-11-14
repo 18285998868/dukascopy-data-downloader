@@ -1,17 +1,16 @@
 //! Stage 1: expand one symbol/timeframe pair into server URLs.
 //!
 //! Dukascopy packs candles into one file per calendar bucket: `D1` is one file
-//! per year, `H1` one file per month and `M1` one file per day. This module maps
-//! a timeframe onto that bucket granularity and renders both the remote URL
-//! and the mirrored local relative path.
+//! per year, `H1` one file per month and `M1` one file per day. The calendar
+//! itself lives in [`crate::config::BucketKey`]; this module only renders a
+//! bucket into the remote and mirrored local path.
 //!
 //! The expansion is **lazy**: [`build_urls`] returns an iterator and allocates
 //! nothing until it is consumed.
 
-use chrono::Datelike;
 use chrono::NaiveDate;
 
-use crate::config::{BucketKey, PriceType, Symbol, Timeframe};
+use crate::config::{BucketKey, PriceType, Symbol, Timeframe, buckets_between};
 
 /// Server-side base on the Dukascopy datafeed.
 ///
@@ -47,8 +46,8 @@ const LOCAL_PREFIX: &str = "dukascopy";
 ///
 /// The symbol is intentionally *not* stored here: every entry produced by a
 /// single [`build_urls`] call shares it, so the caller supplies it once when
-/// constructing a [`DownloadTask`](crate::config::DownloadTask). The calendar
-/// bucket is stored because the missing-range analysis needs it later without
+/// constructing a [`DownloadTask`](crate::DownloadTask). The calendar bucket
+/// is stored because the missing-range analysis needs it later without
 /// re-parsing the destination path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadUrl {
@@ -60,160 +59,14 @@ pub struct DownloadUrl {
     pub bucket: BucketKey,
 }
 
-/// Which calendar bucket a timeframe maps to: one file spans a year/month/day.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PeriodKind {
-    /// One file per calendar year.
-    Year,
-    /// One file per calendar month.
-    Month,
-    /// One file per calendar day.
-    Day,
-}
-
-/// Map a timeframe to its server-side file stem.
-pub(crate) const fn map_timeframe(tf: Timeframe) -> &'static str {
-    match tf {
-        Timeframe::M1 => "candles_min_1",
-        Timeframe::H1 => "candles_hour_1",
-        Timeframe::D1 => "candles_day_1",
-    }
-}
-
-/// Map a timeframe to its calendar bucket granularity.
-pub(crate) const fn tf_period(tf: Timeframe) -> PeriodKind {
-    match tf {
-        Timeframe::D1 => PeriodKind::Year,
-        Timeframe::H1 => PeriodKind::Month,
-        Timeframe::M1 => PeriodKind::Day,
-    }
-}
-
 /// Render the server path of one bucket file, relative to [`FEED_BASE`].
 ///
 /// Both the remote URL and the local mirror are derived from this single
-/// string so the two can never drift apart.
-pub(crate) fn server_path(
-    symbol: &Symbol,
-    price_type: PriceType,
-    tf: Timeframe,
-    date: NaiveDate,
-    period: PeriodKind,
-) -> String {
-    let (y, m, d) = (date.year(), date.month(), date.day());
-    let tfpart = map_timeframe(tf);
-    match period {
-        PeriodKind::Year => format!("{symbol}/{y:04}/{price_type}_{tfpart}.bi5"),
-        PeriodKind::Month => format!("{symbol}/{y:04}/{m:02}/{price_type}_{tfpart}.bi5"),
-        PeriodKind::Day => format!("{symbol}/{y:04}/{m:02}/{d:02}/{price_type}_{tfpart}.bi5"),
-    }
-}
-
-/// Advance from one bucket start to the next, stopping after `last`.
-///
-/// One step function serves all three granularities, which is what lets
-/// [`bucket_dates`] return a single concrete iterator type.
-fn next_bucket(d: NaiveDate, period: PeriodKind, last: NaiveDate) -> Option<NaiveDate> {
-    if d >= last {
-        return None;
-    }
-    match period {
-        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year().checked_add(1)?, 1, 1),
-        PeriodKind::Month => {
-            let (y, m) = if d.month() == 12 {
-                (d.year().checked_add(1)?, 1)
-            } else {
-                (d.year(), d.month() + 1)
-            };
-            NaiveDate::from_ymd_opt(y, m, 1)
-        }
-        PeriodKind::Day => d.succ_opt(),
-    }
-}
-
-/// Truncate `date` down to the start of its bucket and normalise `end` the same way.
-fn bucket_bounds(start: NaiveDate, end: NaiveDate, period: PeriodKind) -> (NaiveDate, NaiveDate) {
-    let floor = |d: NaiveDate| match period {
-        PeriodKind::Year => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d),
-        PeriodKind::Month => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),
-        PeriodKind::Day => d,
-    };
-    (floor(start), floor(end))
-}
-
-/// Lazily yield the inclusive list of bucket-start dates in `[start, end]`.
-fn bucket_dates(
-    start: NaiveDate,
-    end: NaiveDate,
-    period: PeriodKind,
-) -> impl Iterator<Item = NaiveDate> {
-    let (first, last) = bucket_bounds(start, end, period);
-    // `successors` yields its seed unconditionally, so an inverted range must
-    // seed with `None`. Comparing the *raw* dates matters: flooring both to
-    // bucket starts would make `2025-01-05 .. 2025-01-03` look non-empty for a
-    // yearly bucket, where both floors are `2025-01-01`.
-    let seed = (start <= end).then_some(first);
-    std::iter::successors(seed, move |d| next_bucket(*d, period, last))
-}
-
-/// The last calendar day of the month `date` falls in.
-pub(crate) fn last_day_of_month(date: NaiveDate) -> NaiveDate {
-    let (y, m) = (date.year(), date.month());
-    let first_of_next = if m == 12 {
-        NaiveDate::from_ymd_opt(y + 1, 1, 1)
-    } else {
-        NaiveDate::from_ymd_opt(y, m + 1, 1)
-    };
-    first_of_next.and_then(|d| d.pred_opt()).unwrap_or(date)
-}
-
-/// The last calendar day of the month *before* the one `date` falls in.
-pub(crate) fn previous_month_last_day(date: NaiveDate) -> NaiveDate {
-    let (y, m) = (date.year(), date.month());
-    let (py, pm) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
-    last_day_of_month(NaiveDate::from_ymd_opt(py, pm, 1).unwrap_or(date))
-}
-
-/// The last day that a *closed* bucket of this timeframe can cover.
-///
-/// A bucket is one file: one day for `M1`, one month for `H1`, one year for
-/// `D1`. The server keeps appending to a bucket until the last calendar day
-/// it covers has ended, so a bucket is only final afterwards. Downloading an
-/// unfinished bucket caches a file that will never be updated again — the
-/// missing tail becomes a permanent hole in the data.
-///
-/// `end` is the requested upper bound (already clamped to yesterday by
-/// [`crate::config::AppConfig::resolved_end`]); `today` is the current UTC
-/// date.
-///
-/// The result is never greater than `end`, and it is the *end of the last
-/// closed bucket* — so a range whose buckets are all still open yields a
-/// value below `start`, which callers treat as "nothing to download".
-pub(crate) fn last_closed_day(tf: Timeframe, end: NaiveDate, today: NaiveDate) -> NaiveDate {
-    match tf {
-        // The day bucket closes at midnight, and `end` is already in the
-        // past, so it is closed by construction.
-        Timeframe::M1 => end,
-        Timeframe::H1 => {
-            let month_end = last_day_of_month(end);
-            if month_end < today {
-                end
-            } else {
-                // The month is still running: fall back to the previous one.
-                previous_month_last_day(month_end)
-            }
-        }
-        Timeframe::D1 => {
-            let year_end =
-                last_day_of_month(NaiveDate::from_ymd_opt(end.year(), 12, 1).unwrap_or(end));
-            if year_end < today {
-                end
-            } else {
-                // The year is still running: fall back to the previous one.
-                NaiveDate::from_ymd_opt(end.year() - 1, 12, 31).unwrap_or(end)
-            }
-        }
-    }
+/// string so the two can never drift apart. The date components come from
+/// [`BucketKey`]'s `Display`, which is the canonical server layout.
+pub(crate) fn server_path(symbol: &Symbol, price_type: PriceType, bucket: BucketKey) -> String {
+    let file_stem = bucket.timeframe().file_stem();
+    format!("{symbol}/{bucket}/{price_type}_{file_stem}.bi5")
 }
 
 /// Generate download URLs for a single symbol/timeframe pair, lazily.
@@ -250,13 +103,12 @@ pub fn build_urls(
     date_start: NaiveDate,
     date_end: NaiveDate,
 ) -> impl Iterator<Item = DownloadUrl> + '_ {
-    let period = tf_period(tf);
-    bucket_dates(date_start, date_end, period).map(move |date| {
-        let path = server_path(symbol, price_type, tf, date, period);
+    buckets_between(tf, date_start, date_end).map(move |bucket| {
+        let path = server_path(symbol, price_type, bucket);
         DownloadUrl {
             url: format!("{FEED_BASE}/{path}"),
             rel_path: format!("{LOCAL_PREFIX}/{path}"),
-            bucket: BucketKey::new(tf, date),
+            bucket,
         }
     })
 }
@@ -351,7 +203,7 @@ mod tests {
     /// The local mirror must be exactly the URL path after the feed base.
     #[test]
     fn rel_path_mirrors_url_path_suffix() {
-        for tf in [Timeframe::M1, Timeframe::H1, Timeframe::D1] {
+        for tf in Timeframe::ALL {
             for pt in [PriceType::Bid, PriceType::Ask] {
                 let urls = collect("XAUUSD", pt, tf, date(2021, 2, 3), date(2024, 11, 29));
                 assert_ne!(urls.len(), 0);
@@ -517,112 +369,6 @@ mod tests {
         assert_eq!(n, 365, "2023 is not a leap year");
     }
 
-    // — closed buckets —
-
-    #[test]
-    fn a_day_bucket_is_closed_as_soon_as_the_day_is_over() {
-        let end = date(2026, 10, 19);
-        assert_eq!(last_closed_day(Timeframe::M1, end, date(2026, 10, 20)), end);
-    }
-
-    /// The requested range ends inside October, but October's file is still
-    /// being written — the last closed month is September.
-    #[test]
-    fn a_month_bucket_is_not_closed_while_the_month_runs() {
-        assert_eq!(
-            last_closed_day(Timeframe::H1, date(2026, 10, 19), date(2026, 10, 20)),
-            date(2026, 9, 30)
-        );
-    }
-
-    #[test]
-    fn a_month_bucket_is_closed_once_the_month_is_over() {
-        let end = date(2026, 9, 30);
-        assert_eq!(last_closed_day(Timeframe::H1, end, date(2026, 10, 20)), end);
-    }
-
-    #[test]
-    fn a_year_bucket_is_not_closed_while_the_year_runs() {
-        assert_eq!(
-            last_closed_day(Timeframe::D1, date(2026, 10, 19), date(2026, 10, 20)),
-            date(2025, 12, 31)
-        );
-    }
-
-    #[test]
-    fn a_year_bucket_is_closed_once_the_year_is_over() {
-        let end = date(2025, 6, 30);
-        assert_eq!(last_closed_day(Timeframe::D1, end, date(2026, 10, 20)), end);
-    }
-
-    /// The closed bound must never exceed the requested one, whatever the
-    /// timeframe and the date.
-    #[test]
-    fn last_closed_day_never_exceeds_the_requested_end() {
-        for tf in [Timeframe::M1, Timeframe::H1, Timeframe::D1] {
-            for end in [date(2026, 1, 1), date(2026, 10, 19), date(2025, 12, 31)] {
-                let closed = last_closed_day(tf, end, date(2026, 10, 20));
-                assert!(closed <= end, "{tf:?}: {closed} is after {end}");
-            }
-        }
-    }
-
-    #[test]
-    fn last_day_of_month_handles_december_and_leap_years() {
-        assert_eq!(last_day_of_month(date(2026, 12, 5)), date(2026, 12, 31));
-        assert_eq!(last_day_of_month(date(2024, 2, 5)), date(2024, 2, 29));
-        assert_eq!(last_day_of_month(date(2026, 1, 31)), date(2026, 1, 31));
-    }
-
-    #[test]
-    fn previous_month_last_day_rolls_over_the_year() {
-        assert_eq!(
-            previous_month_last_day(date(2026, 10, 19)),
-            date(2026, 9, 30)
-        );
-        assert_eq!(
-            previous_month_last_day(date(2026, 1, 15)),
-            date(2025, 12, 31)
-        );
-        assert_eq!(previous_month_last_day(date(2024, 3, 1)), date(2024, 2, 29));
-    }
-
-    /// New Year's Day is the one boundary where both the yearly and the
-    /// monthly bucket have just closed: the previous year and the previous
-    /// month end on the same calendar day.
-    #[test]
-    fn new_year_closes_the_previous_year_and_month() {
-        let today = date(2026, 1, 1);
-        for tf in [Timeframe::D1, Timeframe::H1] {
-            assert_eq!(
-                last_closed_day(tf, date(2025, 12, 31), today),
-                date(2025, 12, 31),
-                "{tf:?}: the bucket that ended yesterday is closed"
-            );
-            assert_eq!(
-                last_closed_day(tf, date(2026, 1, 1), today),
-                date(2025, 12, 31),
-                "{tf:?}: the bucket that started today is still open"
-            );
-        }
-    }
-
-    // — timeframe mapping —
-
-    #[test]
-    fn map_timeframe_covers_all_variants() {
-        assert_eq!(map_timeframe(Timeframe::M1), "candles_min_1");
-        assert_eq!(map_timeframe(Timeframe::H1), "candles_hour_1");
-        assert_eq!(map_timeframe(Timeframe::D1), "candles_day_1");
-    }
-
-    #[test]
-    fn tf_period_covers_all_variants() {
-        assert_eq!(tf_period(Timeframe::M1), PeriodKind::Day);
-        assert_eq!(tf_period(Timeframe::H1), PeriodKind::Month);
-        assert_eq!(tf_period(Timeframe::D1), PeriodKind::Year);
-    }
-
     // — server_path —
 
     #[test]
@@ -631,9 +377,7 @@ mod tests {
             server_path(
                 &sym("BTCUSD"),
                 PriceType::Ask,
-                Timeframe::D1,
-                date(2024, 6, 15),
-                PeriodKind::Year
+                BucketKey::new(Timeframe::D1, date(2024, 6, 15)),
             ),
             "BTCUSD/2024/ASK_candles_day_1.bi5"
         );
@@ -645,9 +389,7 @@ mod tests {
             server_path(
                 &sym("BTCUSD"),
                 PriceType::Ask,
-                Timeframe::H1,
-                date(2024, 6, 15),
-                PeriodKind::Month
+                BucketKey::new(Timeframe::H1, date(2024, 6, 15)),
             ),
             "BTCUSD/2024/06/ASK_candles_hour_1.bi5"
         );
@@ -659,9 +401,7 @@ mod tests {
             server_path(
                 &sym("BTCUSD"),
                 PriceType::Bid,
-                Timeframe::M1,
-                date(2024, 6, 15),
-                PeriodKind::Day
+                BucketKey::new(Timeframe::M1, date(2024, 6, 15)),
             ),
             "BTCUSD/2024/06/15/BID_candles_min_1.bi5"
         );
@@ -673,9 +413,7 @@ mod tests {
             server_path(
                 &sym("EURUSD"),
                 PriceType::Bid,
-                Timeframe::M1,
-                date(2007, 1, 2),
-                PeriodKind::Day
+                BucketKey::new(Timeframe::M1, date(2007, 1, 2)),
             ),
             "EURUSD/2007/01/02/BID_candles_min_1.bi5"
         );
